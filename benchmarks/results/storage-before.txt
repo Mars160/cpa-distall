@@ -1,0 +1,72 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mars160/cpa-distill/internal/storage
+cpu: Apple M3
+BenchmarkSQLiteAppendBatch/plain4/concurrency=1-8         	    4596	    250689 ns/op	 114.46 MB/s	    5284 B/op	     125 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=1-8         	    5564	    243739 ns/op	 117.73 MB/s	    5261 B/op	     125 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=1-8         	    6362	    244797 ns/op	 117.22 MB/s	    5263 B/op	     125 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=2-8         	    6380	    260474 ns/op	 110.16 MB/s	    5413 B/op	     128 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=2-8         	    6270	    259975 ns/op	 110.38 MB/s	    5404 B/op	     128 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=2-8         	    6337	    260740 ns/op	 110.05 MB/s	    5402 B/op	     128 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=4-8         	    6276	    282551 ns/op	 101.56 MB/s	    5392 B/op	     127 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=4-8         	    6274	    284288 ns/op	 100.94 MB/s	    5388 B/op	     127 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=4-8         	    6214	    283805 ns/op	 101.11 MB/s	    5390 B/op	     127 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=8-8         	    6235	    313080 ns/op	  91.65 MB/s	    5377 B/op	     127 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=8-8         	    6300	    311856 ns/op	  92.01 MB/s	    5377 B/op	     127 allocs/op
+BenchmarkSQLiteAppendBatch/plain4/concurrency=8-8         	    6319	    312323 ns/op	  91.88 MB/s	    5380 B/op	     127 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=1-8       	    3684	    407725 ns/op	  70.38 MB/s	   11788 B/op	     349 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=1-8       	    3720	    406504 ns/op	  70.59 MB/s	   11782 B/op	     349 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=1-8       	    3740	    406518 ns/op	  70.59 MB/s	   11790 B/op	     349 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=2-8       	    3283	    434314 ns/op	  66.07 MB/s	   11901 B/op	     352 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=2-8       	    3295	    433759 ns/op	  66.15 MB/s	   11902 B/op	     352 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=2-8       	    3265	    432927 ns/op	  66.28 MB/s	   11893 B/op	     351 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=4-8       	    3634	    482403 ns/op	  59.48 MB/s	   11866 B/op	     351 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=4-8       	    3564	    465699 ns/op	  61.62 MB/s	   11862 B/op	     351 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=4-8       	    3584	    469956 ns/op	  61.06 MB/s	   11864 B/op	     351 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=8-8       	    3613	    518610 ns/op	  55.33 MB/s	   11862 B/op	     351 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=8-8       	    3613	    514174 ns/op	  55.81 MB/s	   11863 B/op	     351 allocs/op
+BenchmarkSQLiteAppendBatch/stream12/concurrency=8-8       	    3622	    516860 ns/op	  55.52 MB/s	   11860 B/op	     351 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=1-8       	    4784	    310481 ns/op	  92.42 MB/s	    6536 B/op	     171 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=1-8       	    4797	    309572 ns/op	  92.69 MB/s	    6535 B/op	     171 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=1-8       	    4759	    310274 ns/op	  92.48 MB/s	    6537 B/op	     171 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=2-8       	    4802	    330534 ns/op	  86.81 MB/s	    6666 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=2-8       	    4767	    331157 ns/op	  86.65 MB/s	    6673 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=2-8       	    4747	    327623 ns/op	  87.59 MB/s	    6670 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=4-8       	    4748	    355855 ns/op	  80.64 MB/s	    6655 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=4-8       	    4632	    354483 ns/op	  80.95 MB/s	    6652 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=4-8       	    4689	    357429 ns/op	  80.28 MB/s	    6658 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=8-8       	    4741	    390957 ns/op	  73.40 MB/s	    6650 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=8-8       	    4746	    388879 ns/op	  73.79 MB/s	    6647 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=8-8       	    4756	    387590 ns/op	  74.03 MB/s	    6652 B/op	     173 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=1-8     	    3099	    478851 ns/op	  59.92 MB/s	   13047 B/op	     394 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=1-8     	    3117	    471981 ns/op	  60.80 MB/s	   13056 B/op	     395 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=1-8     	    3135	    468640 ns/op	  61.23 MB/s	   13053 B/op	     395 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=2-8     	    3022	    501739 ns/op	  57.19 MB/s	   13163 B/op	     397 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=2-8     	    3028	    503068 ns/op	  57.04 MB/s	   13165 B/op	     397 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=2-8     	    3025	    501895 ns/op	  57.17 MB/s	   13165 B/op	     397 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=4-8     	    3007	    540104 ns/op	  53.13 MB/s	   13139 B/op	     397 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=4-8     	    3034	    541219 ns/op	  53.02 MB/s	   13134 B/op	     397 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=4-8     	    3027	    538915 ns/op	  53.25 MB/s	   13138 B/op	     397 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=8-8     	    3020	    588884 ns/op	  48.73 MB/s	   13134 B/op	     396 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=8-8     	    3018	    596248 ns/op	  48.13 MB/s	   13124 B/op	     396 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=8-8     	    3015	    592566 ns/op	  48.43 MB/s	   13131 B/op	     396 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=1-8         	    3141	    463530 ns/op	  61.91 MB/s	   12773 B/op	     381 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=1-8         	    3189	    466018 ns/op	  61.57 MB/s	   12778 B/op	     381 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=1-8         	    3150	    462247 ns/op	  62.08 MB/s	   12772 B/op	     381 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=2-8         	    3073	    491641 ns/op	  58.37 MB/s	   12893 B/op	     383 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=2-8         	    3078	    494669 ns/op	  58.01 MB/s	   12885 B/op	     383 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=2-8         	    3026	    726148 ns/op	  39.52 MB/s	   12892 B/op	     383 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=4-8         	    3068	    558290 ns/op	  51.40 MB/s	   12857 B/op	     383 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=4-8         	    3049	    531322 ns/op	  54.01 MB/s	   12856 B/op	     383 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=4-8         	    2964	    534509 ns/op	  53.68 MB/s	   12852 B/op	     383 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=8-8         	    3096	    582026 ns/op	  49.30 MB/s	   12846 B/op	     382 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=8-8         	    3050	    591722 ns/op	  48.49 MB/s	   12846 B/op	     382 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=8-8         	    3042	    587014 ns/op	  48.88 MB/s	   12847 B/op	     382 allocs/op
+BenchmarkSQLiteRecordDetail-8                                         	   22216	     53957 ns/op	   69314 B/op	     310 allocs/op
+BenchmarkSQLiteRecordDetail-8                                         	   22119	     54196 ns/op	   69313 B/op	     310 allocs/op
+BenchmarkSQLiteRecordDetail-8                                         	   21726	     53912 ns/op	   69314 B/op	     310 allocs/op
+BenchmarkSQLiteSearchRecords-8                                        	    7870	    149153 ns/op	   21976 B/op	     481 allocs/op
+BenchmarkSQLiteSearchRecords-8                                        	    7838	    149175 ns/op	   21976 B/op	     481 allocs/op
+BenchmarkSQLiteSearchRecords-8                                        	    7861	    149226 ns/op	   21976 B/op	     481 allocs/op
+PASS
+ok  	github.com/mars160/cpa-distill/internal/storage	112.210s
