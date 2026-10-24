@@ -1,0 +1,52 @@
+name: test
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: test -z "$(gofmt -l cmd internal)"
+      - run: go vet ./...
+      - run: make check
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: distill
+          POSTGRES_PASSWORD: distill_test
+          POSTGRES_DB: distill_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U distill -d distill_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CPA_DISTILL_TEST_POSTGRES_DSN: postgres://distill:distill_test@localhost:5432/distill_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - run: go test -race -v ./internal/storage
+      - run: make generate
+      - run: git diff --exit-code -- internal/storage/sqlitedb internal/storage/postgresdb

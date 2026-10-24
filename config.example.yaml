@@ -1,0 +1,23 @@
+# Merge into the CLIProxyAPI config.yaml. Requires a CGO-enabled host with schema 6 support.
+plugins:
+  enabled: true
+  dir: plugins
+  configs:
+    cpa-distill:
+      enabled: true
+      priority: 1
+      driver: sqlite
+      # Absolute path recommended; parent directory must already exist.
+      dsn: /absolute/path/to/cpa-distill.db
+      write_timeout: 5s
+      drain_timeout: 5s
+      max_request_bytes: 67108864
+      max_buffer_bytes: 268435456
+      max_pending_requests: 1024
+      queue_size: 32
+      request_ttl: 30m
+
+      # PostgreSQL alternative (create a dedicated database first):
+      # driver: postgres
+      # dsn: "postgres://distill:password@127.0.0.1:5432/distill?sslmode=verify-full"
+      # For local tests only you may need sslmode=disable; use TLS in production.
