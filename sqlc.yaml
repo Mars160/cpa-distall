@@ -1,0 +1,32 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema:
+      - "internal/storage/schema/sqlite.sql"
+    queries:
+      - "sql/queries/captures.sql"
+    gen:
+      go:
+        package: "sqlitedb"
+        out: "internal/storage/sqlitedb"
+        sql_package: "database/sql"
+        emit_json_tags: false
+        emit_interface: false
+        emit_empty_slices: true
+        emit_exact_table_names: false
+        emit_pointers_for_null_types: false
+  - engine: "postgresql"
+    schema:
+      - "internal/storage/schema/postgres.sql"
+    queries:
+      - "sql/queries/captures.sql"
+    gen:
+      go:
+        package: "postgresdb"
+        out: "internal/storage/postgresdb"
+        sql_package: "database/sql"
+        emit_json_tags: false
+        emit_interface: false
+        emit_empty_slices: true
+        emit_exact_table_names: false
+        emit_pointers_for_null_types: false
