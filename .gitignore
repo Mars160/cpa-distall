@@ -1,0 +1,27 @@
+# Build and test artifacts
+/dist/
+/cpa-distill
+*.test
+/coverage.out
+/coverage.html
+
+# Local databases and SQLite sidecars
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local configuration and secrets (keep templates tracked)
+/config.yaml
+/config.yml
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Python caches and OS files
+__pycache__/
+*.py[cod]
+.DS_Store
