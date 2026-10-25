@@ -4,9 +4,9 @@ package plugin
 //
 // The benchmark drives Plugin.Handle exactly like the host does, using the real
 // hook envelopes (body carried as a base64 string inside the hook JSON) and
-// persists through storage.Open on a real temporary SQLite file (WAL), never
-// through the fake sink used by the unit tests. Every round is a fixed logical
-// load:
+// persists through storage.Open on a real temporary SQLite data directory (WAL
+// shard files), never through the fake sink used by the unit tests. Every round is
+// a fixed logical load:
 //
 //	requests   = 32 per round, spread over 1, 2, 4 or 8 concurrent callers
 //	plain      = 4 hooks  (before, after, response-after, complete)
@@ -45,6 +45,12 @@ package plugin
 // exact body bytes). A throughput number therefore can never be inflated by work
 // the plugin silently discarded. Production defaults (queue_size 32) would drop
 // under this load, which is exactly the effect the assertion prevents here.
+//
+// BenchmarkPluginEndToEnd runs the production layout (writer_count 1, one shard
+// database) so its numbers stay comparable with earlier rounds.
+// BenchmarkPluginEndToEndSharded runs the same load with writer_count equal to the
+// concurrency level, which is the layout the sharding exists for. Both verify the
+// persisted rows byte-for-byte and fail on any drop or write failure.
 //
 // BenchmarkPluginHookOverhead measures the same hook load against a no-op sink
 // that implements the sink interface and performs no I/O. It reports hook
@@ -257,21 +263,21 @@ func (r benchRequest) send(p *Plugin) {
 	p.Handle("usage.handle", r.usage)
 }
 
-func benchPluginConfigYAML(path string) string {
+func benchPluginConfigYAML(dir string, writerCount int) string {
 	return fmt.Sprintf(
-		"driver: sqlite\ndsn: %s\nwrite_timeout: 30s\ndrain_timeout: 30s\nmax_request_bytes: %d\nmax_buffer_bytes: %d\nmax_pending_requests: %d\nqueue_size: %d\nrequest_ttl: 30m\n",
-		path, 64<<20, 1<<30, 4096, 4096,
+		"driver: sqlite\ndsn: %s\nwriter_count: %d\nwrite_timeout: 30s\ndrain_timeout: 30s\nmax_request_bytes: %d\nmax_buffer_bytes: %d\nmax_pending_requests: %d\nqueue_size: %d\nrequest_ttl: 30m\n",
+		dir, writerCount, 64<<20, 1<<30, 4096, 4096,
 	)
 }
 
-func benchPluginConfigure(b *testing.B, p *Plugin, path string) {
+func benchPluginConfigure(b *testing.B, p *Plugin, dir string, writerCount int) {
 	b.Helper()
-	resp := p.Handle("plugin.reconfigure", benchJSON(map[string][]byte{"config_yaml": []byte(benchPluginConfigYAML(path))}))
+	resp := p.Handle("plugin.reconfigure", benchJSON(map[string][]byte{"config_yaml": []byte(benchPluginConfigYAML(dir, writerCount))}))
 	var out struct {
 		OK bool `json:"ok"`
 	}
 	if err := json.Unmarshal(resp, &out); err != nil || !out.OK {
-		b.Fatalf("plugin.reconfigure(%s) failed: %s", path, resp)
+		b.Fatalf("plugin.reconfigure(%s, writer_count %d) failed: %s", dir, writerCount, resp)
 	}
 }
 
@@ -320,21 +326,21 @@ func benchPluginVerify(b *testing.B, p *Plugin, load benchPluginLoad) {
 	wantRequest, wantResponse := benchExpectedBodies(load)
 	var requestBytes, responseBytes int
 	for _, item := range page.Items {
-		detail, err := store.RecordDetail(ctx, item.SessionID, item.RequestID)
+		detail, err := store.RecordDetail(ctx, item.CaptureID)
 		if err != nil {
-			b.Fatalf("RecordDetail(%s/%s): %v", item.SessionID, item.RequestID, err)
+			b.Fatalf("RecordDetail(%s): %v", item.CaptureID, err)
 		}
 		if detail.Record.EventCount != int64(load.events) {
-			b.Fatalf("capture %s/%s has %d hooks, want %d", item.SessionID, item.RequestID, detail.Record.EventCount, load.events)
+			b.Fatalf("capture %s has %d hooks, want %d", item.CaptureID, detail.Record.EventCount, load.events)
 		}
 		if !bytes.Equal(detail.Bodies.RequestBody, wantRequest) {
-			b.Fatalf("capture %s/%s request body = %d bytes, want %d", item.SessionID, item.RequestID, len(detail.Bodies.RequestBody), len(wantRequest))
+			b.Fatalf("capture %s request body = %d bytes, want %d", item.CaptureID, len(detail.Bodies.RequestBody), len(wantRequest))
 		}
 		if !bytes.Equal(detail.Bodies.ResponseBody, wantResponse) {
-			b.Fatalf("capture %s/%s response body = %d bytes, want %d", item.SessionID, item.RequestID, len(detail.Bodies.ResponseBody), len(wantResponse))
+			b.Fatalf("capture %s response body = %d bytes, want %d", item.CaptureID, len(detail.Bodies.ResponseBody), len(wantResponse))
 		}
 		if len(detail.Bodies.WebSocketBody) != 0 {
-			b.Fatalf("capture %s/%s stored %d websocket bytes, want 0", item.SessionID, item.RequestID, len(detail.Bodies.WebSocketBody))
+			b.Fatalf("capture %s stored %d websocket bytes, want 0", item.CaptureID, len(detail.Bodies.WebSocketBody))
 		}
 		requestBytes += len(detail.Bodies.RequestBody)
 		responseBytes += len(detail.Bodies.ResponseBody)
@@ -395,15 +401,45 @@ func benchPluginRound(b *testing.B, p *Plugin, workers int, load benchPluginLoad
 }
 
 // BenchmarkPluginEndToEnd measures the full hook + persistence pipeline for the
-// plain and multi-chunk stream shapes at concurrency 1, 2, 4 and 8.
+// plain and multi-chunk stream shapes at concurrency 1, 2, 4 and 8, with the
+// default single-writer layout.
 func BenchmarkPluginEndToEnd(b *testing.B) {
-	for _, load := range benchPluginLoads {
-		for _, workers := range benchPluginConcurrency {
+	benchPluginEndToEnd(b, benchPluginLoads, benchPluginConcurrency, func(workers int) int { return 1 })
+}
+
+// BenchmarkPluginEndToEndSharded measures the same load with writer_count equal to
+// the concurrency level: every caller level gets that many shard databases and
+// writer goroutines, so the persistence side really scales with the configuration.
+func BenchmarkPluginEndToEndSharded(b *testing.B) {
+	benchPluginEndToEnd(b, benchPluginLoads, benchPluginConcurrency, func(workers int) int { return workers })
+}
+
+// BenchmarkPluginFragmented holds total response bytes constant while increasing
+// chunk count. Additional cases cover a 1 MiB response. Each persisted body is
+// checked byte-for-byte and all drops/failures fail the benchmark.
+func BenchmarkPluginFragmented(b *testing.B) {
+	var loads []benchPluginLoad
+	for _, size := range []int{24 << 10, 1 << 20} {
+		for _, chunks := range []int{128, 1024} {
+			loads = append(loads, benchPluginLoad{
+				name:   fmt.Sprintf("response=%dKiB/chunks=%d", size>>10, chunks),
+				chunks: chunks, events: 4 + chunks, hookBody: benchPluginHookBody,
+				respBody: benchPluginMarker, chunkBody: size / chunks,
+			})
+		}
+	}
+	benchPluginEndToEnd(b, loads, []int{1, 8}, func(workers int) int { return 1 })
+}
+
+func benchPluginEndToEnd(b *testing.B, loads []benchPluginLoad, levels []int, writerCount func(workers int) int) {
+	for _, load := range loads {
+		for _, workers := range levels {
 			b.Run(fmt.Sprintf("%s/concurrency=%d", load.name, workers), func(b *testing.B) {
 				dir := b.TempDir()
+				writers := writerCount(workers)
 				p := New()
 				defer func() { _ = p.Close() }()
-				benchPluginConfigure(b, p, filepath.Join(dir, "round0.db"))
+				benchPluginConfigure(b, p, filepath.Join(dir, "round0"), writers)
 
 				reqs := benchBuildRequests(load)
 				storedBytes := benchStoredBytes(load)
@@ -417,9 +453,9 @@ func BenchmarkPluginEndToEnd(b *testing.B) {
 					h, d := benchPluginRound(b, p, workers, load, reqs)
 					hookTotal += h
 					drainTotal += d
-					// Fresh database per round: keeps rounds independent and the
+					// Fresh data directory per round: keeps rounds independent and the
 					// tables small, and stays outside the measured window.
-					benchPluginConfigure(b, p, filepath.Join(dir, fmt.Sprintf("round%d.db", i+1)))
+					benchPluginConfigure(b, p, filepath.Join(dir, fmt.Sprintf("round%d", i+1)), writers)
 					b.StartTimer()
 				}
 				b.StopTimer()
@@ -447,8 +483,11 @@ type benchNoopSink struct {
 	keys     int64
 }
 
-func (s *benchNoopSink) AppendCapture(context.Context, storage.Capture, storage.CaptureBodies) error {
+func (s *benchNoopSink) AppendCapture(_ context.Context, c storage.Capture, _ storage.CaptureBodies) error {
 	s.mu.Lock()
+	if c.ClientKey != "" {
+		s.keys++ // Includes the key upsert performed by a capture transaction.
+	}
 	s.captures++
 	s.mu.Unlock()
 	return nil
@@ -473,7 +512,8 @@ func (s *benchNoopSink) snapshot() (captures, keys int64) {
 // to separate hook cost from SQLite writer cost.
 //
 // Each round sends benchPluginKeyPool distinct usage keys repeatedly. Key upserts
-// are deduplicated per backend, so exactly one upsert per distinct key is expected
+// are deduplicated per backend; count both independent upserts and keys written
+// within capture transactions, so exactly one write per distinct key is expected
 // for the whole benchmark (the backend is never reconfigured here).
 func BenchmarkPluginHookOverhead(b *testing.B) {
 	for _, load := range benchPluginLoads {
@@ -482,7 +522,7 @@ func BenchmarkPluginHookOverhead(b *testing.B) {
 				sink := &benchNoopSink{}
 				p := NewWithOpener(func(context.Context, storage.Config) (Sink, error) { return sink, nil })
 				defer func() { _ = p.Close() }()
-				benchPluginConfigure(b, p, filepath.Join(b.TempDir(), "noop.db"))
+				benchPluginConfigure(b, p, filepath.Join(b.TempDir(), "noop"), 1)
 
 				reqs := benchBuildRequests(load)
 				storedBytes := benchStoredBytes(load)

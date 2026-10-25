@@ -1,0 +1,27 @@
+# Raw benchmark output for round 3 (sharded storage layer).
+
+goos: darwin
+goarch: arm64
+pkg: github.com/mars160/cpa-distill/internal/storage
+cpu: Apple M3
+BenchmarkSQLiteAppendCapture/plain4/concurrency=1-8         	    7131	    166637 ns/op	 172.20 MB/s	    2159 B/op	      72 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=2-8         	    7574	    179420 ns/op	 159.93 MB/s	    2305 B/op	      75 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=4-8         	    6428	    193147 ns/op	 148.57 MB/s	    2298 B/op	      75 allocs/op
+BenchmarkSQLiteAppendCapture/plain4/concurrency=8-8         	    7532	    191161 ns/op	 150.11 MB/s	    2301 B/op	      75 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=1-8       	    7686	    191520 ns/op	 149.83 MB/s	    2157 B/op	      72 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=2-8       	    5742	    189956 ns/op	 151.06 MB/s	    2303 B/op	      75 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=4-8       	    6938	    193671 ns/op	 148.16 MB/s	    2298 B/op	      75 allocs/op
+BenchmarkSQLiteAppendCapture/stream12/concurrency=8-8       	    7137	    189361 ns/op	 151.54 MB/s	    2296 B/op	      75 allocs/op
+BenchmarkSQLiteAppendCaptureSharded/stream12/shards=4/concurrency=1-8         	    5540	    249982 ns/op	 114.79 MB/s	    2903 B/op	     108 allocs/op
+BenchmarkSQLiteAppendCaptureSharded/stream12/shards=4/concurrency=2-8         	    7942	    199585 ns/op	 143.77 MB/s	    3025 B/op	     111 allocs/op
+BenchmarkSQLiteAppendCaptureSharded/stream12/shards=4/concurrency=4-8         	    9811	    190990 ns/op	 150.24 MB/s	    3159 B/op	     114 allocs/op
+BenchmarkSQLiteAppendCaptureSharded/stream12/shards=4/concurrency=8-8         	    9619	    173449 ns/op	 165.44 MB/s	    3273 B/op	     116 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=1-8                 	    7820	    185646 ns/op	 154.57 MB/s	    1891 B/op	      59 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=2-8                 	    5917	    192905 ns/op	 148.75 MB/s	    2033 B/op	      62 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=4-8                 	    8076	    208986 ns/op	 137.31 MB/s	    2033 B/op	      62 allocs/op
+BenchmarkSQLiteAppendCaptureDeferred/stream12/concurrency=8-8                 	    7202	    181904 ns/op	 157.75 MB/s	    2032 B/op	      62 allocs/op
+BenchmarkSQLiteRecordDetail-8                                                 	   36571	     34852 ns/op	   61046 B/op	      75 allocs/op
+BenchmarkSQLiteSearchRecords-8                                                	   13328	     93495 ns/op	   33800 B/op	     507 allocs/op
+BenchmarkSQLiteSearchRecordsSharded-8                                         	    3376	    362729 ns/op	  120120 B/op	    2013 allocs/op
+PASS
+ok  	github.com/mars160/cpa-distill/internal/storage	30.885s

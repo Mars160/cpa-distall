@@ -1,0 +1,24 @@
+File: cpa-distill-round2-after.test
+Type: delay
+Time: 2026-10-24 20:15:08 CST
+Showing nodes accounting for 583.18ms, 100% of 583.27ms total
+Dropped 200 nodes (cum <= 2.92ms)
+      flat  flat%   sum%        cum   cum%
+  566.21ms 97.08% 97.08%   571.57ms 97.99%  sync.(*Mutex).Unlock
+   16.98ms  2.91%   100%    16.98ms  2.91%  runtime.unlock (partial-inline)
+         0     0%   100%   574.92ms 98.57%  github.com/mars160/cpa-distill/internal/plugin.(*Plugin).Handle
+         0     0%   100%   573.60ms 98.34%  github.com/mars160/cpa-distill/internal/plugin.(*Plugin).record
+         0     0%   100%   574.92ms 98.57%  github.com/mars160/cpa-distill/internal/plugin.benchPluginRound.func1
+         0     0%   100%   565.78ms 97.00%  github.com/mars160/cpa-distill/internal/plugin.benchPluginRound.gowrap1
+         0     0%   100%   574.92ms 98.57%  github.com/mars160/cpa-distill/internal/plugin.benchRequest.send
+         0     0%   100%     2.96ms  0.51%  internal/sync.(*Mutex).Lock (inline)
+         0     0%   100%     5.36ms  0.92%  internal/sync.(*Mutex).Unlock (inline)
+         0     0%   100%     2.96ms  0.51%  internal/sync.(*Mutex).lockSlow
+         0     0%   100%     5.36ms  0.92%  internal/sync.(*Mutex).unlockSlow
+         0     0%   100%     2.96ms  0.51%  internal/sync.runtime_SemacquireMutex
+         0     0%   100%     5.36ms  0.92%  internal/sync.runtime_Semrelease
+         0     0%   100%     3.94ms  0.68%  runtime.mcall
+         0     0%   100%     3.86ms  0.66%  runtime.park_m
+         0     0%   100%     2.96ms  0.51%  runtime.semacquire1
+         0     0%   100%     5.36ms  0.92%  runtime.semrelease1
+         0     0%   100%     2.96ms  0.51%  sync.(*Mutex).Lock (inline)

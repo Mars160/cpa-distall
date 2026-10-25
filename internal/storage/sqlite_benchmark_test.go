@@ -2,10 +2,15 @@ package storage
 
 // Performance baseline for the SQLite engine of the distill plugin.
 //
-// The benchmarks always use a real temporary file (never ":memory:") so the WAL,
-// the single-connection pool and the on-disk indexes behave exactly as in
-// production. benchOpenStore asserts that journal_mode really is WAL, so a
+// The benchmarks always use a real temporary data directory (never ":memory:") so
+// the WAL, the single-connection shard pool and the on-disk indexes behave exactly
+// as in production. benchOpenStore asserts that journal_mode really is WAL, so a
 // baseline can never be silently recorded against a rollback-journal database.
+//
+// The default shape is writer_count=1: one shard database, the layout every
+// deployment had before sharding, so the numbers stay comparable with the
+// baseline. BenchmarkSQLiteAppendCaptureSharded additionally measures the same
+// load with four shard databases, where the writers really run in parallel.
 //
 // The logical load is fixed and identical for both request shapes. It is the same
 // body byte volume per request as the baseline, only redistributed over the three
@@ -23,8 +28,10 @@ package storage
 // 28,695 B is what its SetBytes and MB/s numbers were computed from and what the
 // reworked benchmark keeps to stay comparable.
 //
-// Store serialises writers on one connection, so the concurrency levels describe
-// how the engine behaves under concurrent callers, not real write parallelism.
+// Store serialises writers on the single connection of a shard, so at
+// writer_count=1 the concurrency levels describe how the engine behaves under
+// concurrent callers, not real write parallelism; the sharded benchmark below
+// measures what several shard databases add.
 //
 // The sub-benchmark names (plain4/stream12) are kept identical to the
 // baseline so the numbers stay comparable; they no longer count hook events, which
@@ -42,6 +49,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -106,25 +114,42 @@ func benchBodies(load benchLoad) CaptureBodies {
 	}
 }
 
-// benchOpenStore opens a real SQLite file in a temporary directory and verifies
-// that it runs in WAL mode.
-func benchOpenStore(b *testing.B, name string) *Store {
+// benchCaptureID builds a valid, unique capture ID without hashing, so the measured
+// path never pays for identity generation. 16 hex characters per half keeps it at
+// the canonical 32 characters.
+func benchCaptureID(worker, iter int) string {
+	return fmt.Sprintf("%016x%016x", worker, iter)
+}
+
+// benchOpenStore opens a real sharded SQLite layout in a temporary directory and
+// verifies that every shard runs in WAL mode.
+func benchOpenStore(b *testing.B, name string, writerCount int) *Store {
 	b.Helper()
-	path := filepath.Join(b.TempDir(), name+".db")
-	store, err := Open(context.Background(), Config{Driver: DriverSQLite, DSN: path})
+	dir := filepath.Join(b.TempDir(), name)
+	store, err := Open(context.Background(), Config{Driver: DriverSQLite, DSN: dir, WriterCount: writerCount})
 	if err != nil {
-		b.Fatalf("Open(sqlite %s): %v", path, err)
+		b.Fatalf("Open(sqlite %s, writer_count %d): %v", dir, writerCount, err)
 	}
 	b.Cleanup(func() { _ = store.Close() })
 
-	var mode string
-	if err := store.db.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&mode); err != nil {
-		b.Fatalf("PRAGMA journal_mode: %v", err)
-	}
-	if !strings.EqualFold(strings.TrimSpace(mode), "wal") {
-		b.Fatalf("journal_mode = %q, want wal (benchmark must run on a WAL file)", mode)
-	}
+	forEachShardB(b, store, func(index int, db *sql.DB) {
+		var mode string
+		if err := db.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&mode); err != nil {
+			b.Fatalf("shard %d PRAGMA journal_mode: %v", index, err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(mode), "wal") {
+			b.Fatalf("shard %d journal_mode = %q, want wal (benchmark must run on WAL files)", index, mode)
+		}
+	})
 	return store
+}
+
+// forEachShardB is forEachShard for benchmarks.
+func forEachShardB(b *testing.B, store *Store, check func(index int, db *sql.DB)) {
+	b.Helper()
+	for _, sh := range store.shards {
+		check(sh.index, sh.db)
+	}
 }
 
 // benchRunConcurrent runs exactly b.N operations spread over workers goroutines
@@ -199,14 +224,13 @@ func BenchmarkSQLiteAppendCapture(b *testing.B) {
 	for _, load := range benchLoads {
 		for _, workers := range benchLevels {
 			b.Run(fmt.Sprintf("%s/concurrency=%d", load.name, workers), func(b *testing.B) {
-				store := benchOpenStore(b, "append-capture")
+				store := benchOpenStore(b, "append-capture", 1)
 				bodies := benchBodies(load)
 				b.SetBytes(int64(load.payload))
 				b.ReportAllocs()
 				benchRunConcurrent(b, workers, func(worker, iter int) error {
 					capture := Capture{
-						SessionID:      fmt.Sprintf("sess-%d", worker),
-						RequestID:      fmt.Sprintf("req-%d", iter),
+						CaptureID:      benchCaptureID(worker, iter),
 						ClientKey:      "sk-bench-client-key-0001",
 						ClientKeyID:    fmt.Sprintf("scope-%d-%d", worker, iter),
 						Model:          "gpt-bench",
@@ -224,6 +248,36 @@ func BenchmarkSQLiteAppendCapture(b *testing.B) {
 	}
 }
 
+// BenchmarkSQLiteAppendCaptureSharded runs the same stream12 load against four
+// shard databases. Every capture lands in the shard its capture ID maps to, so the
+// concurrent writers do not queue behind one SQLite write lock.
+func BenchmarkSQLiteAppendCaptureSharded(b *testing.B) {
+	load := benchLoads[1]
+	for _, workers := range benchLevels {
+		b.Run(fmt.Sprintf("stream12/shards=4/concurrency=%d", workers), func(b *testing.B) {
+			store := benchOpenStore(b, "append-capture-sharded", 4)
+			bodies := benchBodies(load)
+			b.SetBytes(int64(load.payload))
+			b.ReportAllocs()
+			benchRunConcurrent(b, workers, func(worker, iter int) error {
+				capture := Capture{
+					CaptureID:      benchCaptureID(worker, iter),
+					ClientKey:      "sk-bench-client-key-0001",
+					ClientKeyID:    fmt.Sprintf("scope-%d-%d", worker, iter),
+					Model:          "gpt-bench",
+					RequestedModel: "gpt-bench-alias",
+					SourceFormat:   "openai",
+					Stream:         load.stream,
+					StartedAt:      benchBase,
+					CompletedAt:    benchBase.Add(time.Second),
+					EventCount:     12,
+				}
+				return store.AppendCapture(context.Background(), capture, bodies)
+			})
+		})
+	}
+}
+
 // BenchmarkSQLiteAppendCaptureDeferred measures the path where the client key is
 // still unknown when the summary is written: the scope is stored but no key row is
 // upserted.
@@ -231,14 +285,13 @@ func BenchmarkSQLiteAppendCaptureDeferred(b *testing.B) {
 	load := benchLoads[1] // stream12
 	for _, workers := range benchLevels {
 		b.Run(fmt.Sprintf("stream12/concurrency=%d", workers), func(b *testing.B) {
-			store := benchOpenStore(b, "append-capture-deferred")
+			store := benchOpenStore(b, "append-capture-deferred", 1)
 			bodies := benchBodies(load)
 			b.SetBytes(int64(load.payload))
 			b.ReportAllocs()
 			benchRunConcurrent(b, workers, func(worker, iter int) error {
 				capture := Capture{
-					SessionID:      fmt.Sprintf("sess-%d", worker),
-					RequestID:      fmt.Sprintf("req-%d", iter),
+					CaptureID:      benchCaptureID(worker, iter),
 					ClientKeyID:    fmt.Sprintf("scope-%d-%d", worker, iter),
 					Model:          "gpt-bench",
 					RequestedModel: "gpt-bench-alias",
@@ -263,8 +316,7 @@ func benchSeedRecords(b *testing.B, store *Store, n int) {
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
 		capture := Capture{
-			SessionID:      fmt.Sprintf("seed-sess-%d", i/10),
-			RequestID:      fmt.Sprintf("seed-req-%d", i),
+			CaptureID:      benchCaptureID(0, i),
 			ClientKey:      "sk-bench-client-key-0001",
 			ClientKeyID:    fmt.Sprintf("seed-scope-%d", i%8),
 			Model:          "gpt-bench",
@@ -282,16 +334,17 @@ func benchSeedRecords(b *testing.B, store *Store, n int) {
 }
 
 // BenchmarkSQLiteRecordDetail measures reading one summary plus its body row, the
-// query behind the record detail view.
+// query behind the record detail view. The capture ID locates the shard, so the
+// lookup is a primary-key read instead of a scan.
 func BenchmarkSQLiteRecordDetail(b *testing.B) {
-	store := benchOpenStore(b, "record-detail")
+	store := benchOpenStore(b, "record-detail", 1)
 	const seeded = 200
 	benchSeedRecords(b, store, seeded)
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		idx := i % seeded
-		if _, err := store.RecordDetail(context.Background(), fmt.Sprintf("seed-sess-%d", idx/10), fmt.Sprintf("seed-req-%d", idx)); err != nil {
+		if _, err := store.RecordDetail(context.Background(), benchCaptureID(0, idx)); err != nil {
 			b.Fatalf("RecordDetail: %v", err)
 		}
 	}
@@ -300,7 +353,21 @@ func BenchmarkSQLiteRecordDetail(b *testing.B) {
 // BenchmarkSQLiteSearchRecords measures one page of the record list, including
 // the COUNT(*) that SearchRecords always performs.
 func BenchmarkSQLiteSearchRecords(b *testing.B) {
-	store := benchOpenStore(b, "search-records")
+	store := benchOpenStore(b, "search-records", 1)
+	benchSeedRecords(b, store, 200)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := store.SearchRecords(context.Background(), RecordFilter{Page: 1, PageSize: 20}); err != nil {
+			b.Fatalf("SearchRecords: %v", err)
+		}
+	}
+}
+
+// BenchmarkSQLiteSearchRecordsSharded measures the same page against four shards,
+// where the merge pays for one bounded scan per shard.
+func BenchmarkSQLiteSearchRecordsSharded(b *testing.B) {
+	store := benchOpenStore(b, "search-records-sharded", 4)
 	benchSeedRecords(b, store, 200)
 	b.ResetTimer()
 	b.ReportAllocs()

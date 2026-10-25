@@ -1,0 +1,13 @@
+File: cpa-distill-round2-before.test
+Type: delay
+Time: 2026-10-24 19:58:27 CST
+Showing nodes accounting for 1368.77ms, 100% of 1368.79ms total
+Dropped 245 nodes (cum <= 6.84ms)
+      flat  flat%   sum%        cum   cum%
+ 1354.81ms 98.98% 98.98%  1358.15ms 99.22%  sync.(*Mutex).Unlock
+   13.96ms  1.02%   100%    13.96ms  1.02%  runtime.unlock (inline)
+         0     0%   100%  1359.99ms 99.36%  github.com/mars160/cpa-distill/internal/plugin.(*Plugin).Handle
+         0     0%   100%  1359.28ms 99.30%  github.com/mars160/cpa-distill/internal/plugin.(*Plugin).record
+         0     0%   100%  1359.99ms 99.36%  github.com/mars160/cpa-distill/internal/plugin.benchPluginRound.func1
+         0     0%   100%  1354.22ms 98.94%  github.com/mars160/cpa-distill/internal/plugin.benchPluginRound.gowrap1
+         0     0%   100%  1359.99ms 99.36%  github.com/mars160/cpa-distill/internal/plugin.benchRequest.send
