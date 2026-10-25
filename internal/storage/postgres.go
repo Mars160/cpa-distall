@@ -14,7 +14,16 @@ import (
 
 const postgresDriverName = "pgx"
 
-func openPostgres(ctx context.Context, dsn string) (*Store, error) {
+// minPostgresConns is the smallest pool the store keeps, so a single-writer
+// configuration still has room for the background writers and for the read-only
+// management queries of the panel.
+const minPostgresConns = 4
+
+// openPostgres opens the single PostgreSQL database of one plugin instance. The
+// driver is not sharded: writer_count only sizes the connection pool, so the
+// configured number of concurrent writers can really run in parallel on one
+// database.
+func openPostgres(ctx context.Context, dsn string, writerCount int) (*Store, error) {
 	dsn = strings.TrimSpace(dsn)
 	if dsn == "" {
 		return nil, errors.New("storage: postgres driver requires a DSN")
@@ -23,8 +32,13 @@ func openPostgres(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: open postgres: %w", err)
 	}
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	// One pooled connection per configured writer, never fewer than the minimum.
+	conns := writerCount
+	if conns < minPostgresConns {
+		conns = minPostgresConns
+	}
+	db.SetMaxOpenConns(conns)
+	db.SetMaxIdleConns(conns)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	if err := db.PingContext(ctx); err != nil {
@@ -33,13 +47,20 @@ func openPostgres(ctx context.Context, dsn string) (*Store, error) {
 	}
 	if err := applySchema(ctx, db, DriverPostgres, postgresSchema); err != nil {
 		db.Close()
-		return nil, err
+		// An existing database from another plugin version is never migrated or
+		// dropped, so a schema that cannot be applied is reported as an
+		// incompatibility.
+		return nil, fmt.Errorf("storage: postgres is incompatible with this schema; migrate it manually (existing data is never dropped automatically): %w", err)
 	}
 	if err := verifySchema(ctx, db, DriverPostgres); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, driver: DriverPostgres, rows: postgresRows{q: postgresdb.New(db)}}, nil
+	return &Store{
+		driver:      DriverPostgres,
+		writerCount: writerCount,
+		shards:      []*shard{{index: 0, db: db, rows: postgresRows{q: postgresdb.New(db)}}},
+	}, nil
 }
 
 type postgresRows struct {
@@ -50,9 +71,9 @@ func (r postgresRows) withTx(tx *sql.Tx) rowStore {
 	return postgresRows{q: r.q.WithTx(tx)}
 }
 
-func (r postgresRows) insertCapture(ctx context.Context, c Capture) error {
+func (r postgresRows) insertCapture(ctx context.Context, captureID []byte, c Capture) error {
 	return r.q.InsertCapture(ctx, postgresdb.InsertCaptureParams{
-		SessionID:      c.SessionID,
+		CaptureID:      captureID,
 		RequestID:      c.RequestID,
 		ClientKeyID:    c.ClientKeyID,
 		Model:          c.Model,
@@ -65,18 +86,17 @@ func (r postgresRows) insertCapture(ctx context.Context, c Capture) error {
 	})
 }
 
-func (r postgresRows) insertCaptureBodies(ctx context.Context, sessionID, requestID string, b CaptureBodies) error {
+func (r postgresRows) insertCaptureBodies(ctx context.Context, captureID []byte, b CaptureBodies) error {
 	return r.q.InsertCaptureBodies(ctx, postgresdb.InsertCaptureBodiesParams{
-		SessionID:     sessionID,
-		RequestID:     requestID,
+		CaptureID:     captureID,
 		RequestBody:   b.RequestBody,
 		ResponseBody:  b.ResponseBody,
 		WebsocketBody: b.WebSocketBody,
 	})
 }
 
-func (r postgresRows) getCaptureBodies(ctx context.Context, sessionID, requestID string) (CaptureBodies, error) {
-	row, err := r.q.GetCaptureBodies(ctx, postgresdb.GetCaptureBodiesParams{SessionID: sessionID, RequestID: requestID})
+func (r postgresRows) getCaptureBodies(ctx context.Context, captureID []byte) (CaptureBodies, error) {
+	row, err := r.q.GetCaptureBodies(ctx, captureID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		// A summary without bodies is read as empty bodies; the append path always
@@ -92,12 +112,12 @@ func (r postgresRows) upsertClientKey(ctx context.Context, keyID, clientKey stri
 	return r.q.UpsertClientKey(ctx, postgresdb.UpsertClientKeyParams{KeyID: keyID, ClientKey: clientKey})
 }
 
-func (r postgresRows) getCapture(ctx context.Context, sessionID, requestID string) (Capture, error) {
-	row, err := r.q.GetCapture(ctx, postgresdb.GetCaptureParams{SessionID: sessionID, RequestID: requestID})
+func (r postgresRows) getCapture(ctx context.Context, captureID []byte) (Capture, error) {
+	row, err := r.q.GetCapture(ctx, captureID)
 	if err != nil {
 		return Capture{}, err
 	}
-	return captureFromRow(row.SessionID, row.RequestID, "", row.ClientKeyID, row.Model, row.RequestedModel, row.SourceFormat, row.Stream, row.StartedAtUs, row.CompletedAtUs, row.EventCount), nil
+	return captureFromRow(row.CaptureID, row.RequestID, "", row.ClientKeyID, row.Model, row.RequestedModel, row.SourceFormat, row.Stream, row.StartedAtUs, row.CompletedAtUs, row.EventCount), nil
 }
 
 func (r postgresRows) countRecords(ctx context.Context, q recordQuery) (int64, error) {
@@ -116,14 +136,14 @@ func (r postgresRows) listRecords(ctx context.Context, q recordQuery) ([]Capture
 		KeyID:       q.keyParam(),
 		FilterModel: q.modelParam(),
 		PageOffset:  int32(q.Offset),
-		PageSize:    int32(q.Limit),
+		PageLimit:   int32(q.Limit),
 	})
 	if err != nil {
 		return nil, err
 	}
 	out := make([]Capture, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, captureFromRow(row.SessionID, row.RequestID, row.ClientKey, row.ClientKeyID, row.Model, row.RequestedModel, row.SourceFormat, row.Stream, row.StartedAtUs, row.CompletedAtUs, row.EventCount))
+		out = append(out, captureFromRow(row.CaptureID, row.RequestID, row.ClientKey, row.ClientKeyID, row.Model, row.RequestedModel, row.SourceFormat, row.Stream, row.StartedAtUs, row.CompletedAtUs, row.EventCount))
 	}
 	return out, nil
 }

@@ -57,6 +57,12 @@ func (p *Plugin) handleManagement(raw []byte) []byte {
 		if b := p.current; b != nil {
 			reader, _ = b.sink.(panel.Reader)
 			stats.QueueLength = len(b.queue)
+			stats.Writers = b.cfg.WriterCount
+			// The number of physical databases is driver specific: writer_count shard
+			// files for SQLite, one database for PostgreSQL.
+			if counter, ok := b.sink.(interface{ ShardCount() int }); ok {
+				stats.Shards = counter.ShardCount()
+			}
 			timeout = b.cfg.Timeout()
 		}
 		p.mu.Unlock()

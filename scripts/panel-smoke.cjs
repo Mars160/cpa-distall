@@ -97,11 +97,12 @@ const bodies = {
   websocket_body: b64bytes(binaryWebSocketBody),
 };
 
-const record = { session_id: 's1', request_id: 'r1', client_key_id: 'k1', model: 'gpt-4o-2024', requested_model: 'gpt-4o', source_format: 'openai', stream: true, started_at: '2024-05-01T10:00:00Z', completed_at: '2024-05-01T10:00:02Z', event_count: 8 };
+const captureId = 'c0ffee0011223344556677889900aabb';
+const record = { capture_id: captureId, request_id: 'req-panel-fixture-1', client_key_id: 'k1', model: 'gpt-4o-2024', requested_model: 'gpt-4o', source_format: 'openai', stream: true, started_at: '2024-05-01T10:00:00Z', completed_at: '2024-05-01T10:00:02Z', event_count: 8 };
 
 const responses = {
   'GET /base/records/options': { keys: [{ id: 'k1', label: 'sk-****abcd' }], models: ['gpt-4o'] },
-  'GET /base/status': { pending_requests: 1, buffer_bytes: 2048, dropped: 0, write_failures: 0, queue_length: 2 },
+  'GET /base/status': { pending_requests: 1, buffer_bytes: 2048, writers: 4, shards: 4, dropped: 0, write_failures: 0, queue_length: 2 },
   'POST /base/records/search': { items: [record], total: 41, page: 1, page_size: 20 },
   'POST /base/records/detail': { record, bodies },
 };
@@ -207,6 +208,7 @@ const settle = async () => { for (let i = 0; i < 12; i += 1) await tick(); };
   check('Key 下拉 value 为 id', registry.get('filter-key').children[1].attrs.value === 'k1');
   check('模型下拉含模型', registry.get('filter-model').children.map((c) => c.textContent).join('|').includes('gpt-4o'));
   check('状态栏已填充', registry.get('status-bar').textContent.includes('待处理 1'), registry.get('status-bar').textContent);
+  check('状态栏显示写入者与分片', registry.get('status-bar').textContent.includes('写入者 4') && registry.get('status-bar').textContent.includes('分片 4'), registry.get('status-bar').textContent);
 
   // 3. 查询
   const searchCall = calls.filter((c) => c.key === 'POST /base/records/search').pop();
@@ -266,12 +268,31 @@ const settle = async () => { for (let i = 0; i < 12; i += 1) await tick(); };
   const sized = JSON.parse(calls.filter((c) => c.key === 'POST /base/records/search').pop().init.body);
   check('page_size=100 生效', sized.page_size === 100, JSON.stringify(sized));
 
+  // 9b. 跳分片窗口上限：后端只服务 offset+limit ≤ 10000 的页，面板必须自己收住页码
+  responses['POST /base/records/search'] = { items: [record], total: 25000, page: 1, page_size: 100 };
+  registry.get('search').dispatch('click');
+  await settle();
+  check('窗口内下一页仍可用', registry.get('page-next').disabled === false);
+  registry.get('page-last').dispatch('click');
+  await settle();
+  const clamped = JSON.parse(calls.filter((c) => c.key === 'POST /base/records/search').pop().init.body);
+  check('末页收敛到窗口内最后一页', clamped.page === 100, JSON.stringify(clamped));
+  responses['POST /base/records/search'] = { items: [record], total: 25000, page: 100, page_size: 100 };
+  registry.get('search').dispatch('click');
+  await settle();
+  check('窗口外禁用下一页/末页', registry.get('page-next').disabled === true && registry.get('page-last').disabled === true);
+  check('分页信息提示窗口上限', registry.get('page-info').textContent.includes('仅可浏览前 10000 条'), registry.get('page-info').textContent);
+  responses['POST /base/records/search'] = { items: [record], total: 41, page: 1, page_size: 20 };
+  registry.get('filter-page-size').value = '20';
+  registry.get('filter-page-size').dispatch('change');
+  await settle();
+
   // 10. 详情：原始字节而非事件列表
   registry.get('records-body').children[0].dispatch('click');
   await settle();
   check('详情抽屉打开', registry.get('drawer').hidden === false);
   const detailText = registry.get('drawer-body').text();
-  check('详情含基础信息', detailText.includes('基础信息') && detailText.includes('s1'));
+  check('详情含基础信息', detailText.includes('基础信息') && detailText.includes(captureId) && detailText.includes('request_id') && detailText.includes('req-panel-fixture-1'));
   check('详情含请求正文原文', detailText.includes('"messages"'));
   check('详情含响应正文文本', detailText.includes('你好') && detailText.includes('世界'));
   check('详情含 WebSocket 正文说明', detailText.includes('上游 WebSocket') && detailText.includes('不是客户端下游'));
@@ -279,7 +300,8 @@ const settle = async () => { for (let i = 0; i < 12; i += 1) await tick(); };
   check('超长预览被截断并提示', detailText.includes('仅显示前') && !detailText.includes(bigText.slice(0, 400 * 1024)), detailText.length);
   check('详情不再展示事件语义', !detailText.includes('原始事件') && !detailText.includes('sequence') && !detailText.includes('ChunkIndex -'), detailText.slice(0, 120));
   const detailCall = calls.filter((c) => c.key === 'POST /base/records/detail').pop();
-  check('详情请求体含 session/request', detailCall.init.body.includes('"session_id":"s1"') && detailCall.init.body.includes('"request_id":"r1"'), detailCall.init.body);
+  check('详情请求体含 capture_id', detailCall.init.body.includes('"capture_id":"' + captureId + '"'), detailCall.init.body);
+  check('详情请求体不含 session/request', !detailCall.init.body.includes('session_id') && !detailCall.init.body.includes('request_id'), detailCall.init.body);
   check('详情请求带 Authorization', detailCall.init.headers.Authorization === 'Bearer secret-management-key');
 
   // 11. 下载按钮下载的是原始字节，不是事件 JSON

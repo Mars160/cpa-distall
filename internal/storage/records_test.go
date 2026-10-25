@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -13,10 +15,9 @@ import (
 
 // captureAt builds a summary whose timestamps are microsecond-aligned, the
 // precision the captures table stores.
-func captureAt(session, request, keyID, key, model, requested string, startedAt time.Time) Capture {
+func captureAt(captureID, keyID, key, model, requested string, startedAt time.Time) Capture {
 	return Capture{
-		SessionID:      session,
-		RequestID:      request,
+		CaptureID:      captureID,
 		ClientKey:      key,
 		ClientKeyID:    keyID,
 		Model:          model,
@@ -30,20 +31,19 @@ func captureAt(session, request, keyID, key, model, requested string, startedAt 
 
 func TestSQLiteAppendCaptureStoresSummaryWithBodies(t *testing.T) {
 	ctx := context.Background()
-	store, path := openTempSQLite(t)
+	store, dir := openTempSQLite(t)
 
 	const (
-		session = "sess-capture"
-		request = "req-capture"
-		keyID   = "3f1c9b0e5d2a4c6f8b1e3d5a7c9f0b2d4e6a8c0f1b3d5e7a9c1b3d5f7a9c1b3d"
-		key     = "sk-live-abcdefghijklmnopqrstuvwxyz"
+		keyID = "3f1c9b0e5d2a4c6f8b1e3d5a7c9f0b2d4e6a8c0f1b3d5e7a9c1b3d5f7a9c1b3d"
+		key   = "sk-live-abcdefghijklmnopqrstuvwxyz"
 	)
+	captureID := testCaptureID("summary-with-bodies")
 	startedAt := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
 	requestBody := binaryPayload()
 	responseBody := []byte(`{"id":"chatcmpl-1","choices":[]}`)
 	websocketBody := []byte{0x00, 0xff, 0xfe, 0x80}
 
-	capture := captureAt(session, request, keyID, key, "gpt-5", "gpt-5-mini", startedAt)
+	capture := captureAt(captureID, keyID, key, "gpt-5", "gpt-5-mini", startedAt)
 	capture.EventCount = 12
 	if err := store.AppendCapture(ctx, capture, CaptureBodies{
 		RequestBody:   requestBody,
@@ -62,7 +62,7 @@ func TestSQLiteAppendCaptureStoresSummaryWithBodies(t *testing.T) {
 		t.Fatalf("stored client key = %q, want the original key", got)
 	}
 
-	detail, err := store.RecordDetail(ctx, session, request)
+	detail, err := store.RecordDetail(ctx, captureID)
 	if err != nil {
 		t.Fatalf("RecordDetail: %v", err)
 	}
@@ -88,12 +88,8 @@ func TestSQLiteAppendCaptureStoresSummaryWithBodies(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	reopened, err := Open(ctx, Config{Driver: DriverSQLite, DSN: path})
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer reopened.Close()
-	again, err := reopened.RecordDetail(ctx, session, request)
+	reopened := reopenTempSQLite(t, dir, 1)
+	again, err := reopened.RecordDetail(ctx, captureID)
 	if err != nil {
 		t.Fatalf("RecordDetail after reopen: %v", err)
 	}
@@ -106,8 +102,7 @@ func TestSQLiteAppendCaptureStoresSummaryWithBodies(t *testing.T) {
 
 	// A capture without a scope never writes a key row.
 	if err := reopened.AppendCapture(ctx, Capture{
-		SessionID:   session,
-		RequestID:   "req-no-scope",
+		CaptureID:   testCaptureID("no-scope"),
 		ClientKey:   "sk-ignored-because-there-is-no-scope",
 		StartedAt:   startedAt,
 		CompletedAt: startedAt.Add(time.Second),
@@ -123,15 +118,20 @@ func TestSQLiteAppendCaptureValidation(t *testing.T) {
 	ctx := context.Background()
 	store, _ := openTempSQLite(t)
 	at := time.Date(2026, 7, 8, 9, 10, 11, 0, time.UTC)
-	valid := captureAt("sess", "req", "keyid", "sk-secret-value-0123456789", "m", "", at)
+	valid := captureAt(testCaptureID("valid"), "keyid", "sk-secret-value-0123456789", "m", "", at)
 
 	cases := map[string]Capture{
-		"no session":      {RequestID: valid.RequestID, StartedAt: at, CompletedAt: at.Add(time.Second)},
-		"no started at":   {SessionID: valid.SessionID, RequestID: valid.RequestID, CompletedAt: at},
-		"no completed at": {SessionID: valid.SessionID, RequestID: valid.RequestID, StartedAt: at},
-		"completed before": {SessionID: valid.SessionID, RequestID: valid.RequestID, StartedAt: at,
+		"no capture id":    {StartedAt: at, CompletedAt: at.Add(time.Second)},
+		"blank capture id": {CaptureID: "   ", StartedAt: at, CompletedAt: at.Add(time.Second)},
+		"short capture id": {CaptureID: testCaptureID("short")[:30], StartedAt: at, CompletedAt: at.Add(time.Second)},
+		"long capture id":  {CaptureID: testCaptureID("long") + "ab", StartedAt: at, CompletedAt: at.Add(time.Second)},
+		"non hex capture id": {CaptureID: strings.Repeat("z", CaptureIDHexLen), StartedAt: at,
+			CompletedAt: at.Add(time.Second)},
+		"no started at":   {CaptureID: valid.CaptureID, CompletedAt: at},
+		"no completed at": {CaptureID: valid.CaptureID, StartedAt: at},
+		"completed before": {CaptureID: valid.CaptureID, StartedAt: at,
 			CompletedAt: at.Add(-time.Second)},
-		"negative count": {SessionID: valid.SessionID, RequestID: valid.RequestID, StartedAt: at, CompletedAt: at, EventCount: -1},
+		"negative count": {CaptureID: valid.CaptureID, StartedAt: at, CompletedAt: at, EventCount: -1},
 	}
 	for name, c := range cases {
 		err := store.AppendCapture(ctx, c, CaptureBodies{})
@@ -149,12 +149,19 @@ func TestSQLiteAppendCaptureValidation(t *testing.T) {
 	if got := countBodies(t, store); got != 0 {
 		t.Fatalf("rejected captures stored %d body rows, want 0", got)
 	}
+	// An invalid ID must never reach a query: the detail lookup rejects it too.
+	if _, err := store.RecordDetail(ctx, "not-a-capture-id"); err == nil {
+		t.Fatal("RecordDetail(invalid ID) succeeded, want error")
+	}
+	if _, err := store.GetRecord(ctx, testCaptureID("valid")[:16]); err == nil {
+		t.Fatal("GetRecord(short ID) succeeded, want error")
+	}
 
 	// A capture with no bodies is allowed and stores an empty body row.
 	if err := store.AppendCapture(ctx, valid, CaptureBodies{}); err != nil {
 		t.Fatalf("AppendCapture(no bodies): %v", err)
 	}
-	detail, err := store.RecordDetail(ctx, "sess", "req")
+	detail, err := store.RecordDetail(ctx, valid.CaptureID)
 	if err != nil {
 		t.Fatalf("RecordDetail: %v", err)
 	}
@@ -165,7 +172,13 @@ func TestSQLiteAppendCaptureValidation(t *testing.T) {
 		t.Fatalf("stored %d body rows, want 1", got)
 	}
 	if err := store.AppendCapture(ctx, valid, CaptureBodies{}); err == nil {
-		t.Fatal("AppendCapture with a duplicate (session_id, request_id) succeeded, want constraint error")
+		t.Fatal("AppendCapture with a duplicate capture ID succeeded, want constraint error")
+	}
+	// Uppercase hex names the same capture: the ID is normalised, so it collides.
+	upper := valid
+	upper.CaptureID = strings.ToUpper(valid.CaptureID)
+	if err := store.AppendCapture(ctx, upper, CaptureBodies{}); err == nil {
+		t.Fatal("AppendCapture(uppercase duplicate) succeeded, want constraint error")
 	}
 }
 
@@ -180,14 +193,15 @@ func TestSQLiteAppendCaptureRollsBackAsOneUnit(t *testing.T) {
 		keyA   = "sk-first-key-0123456789"
 		keyB   = "sk-second-key-9876543210"
 	)
-	first := captureAt("sess", "req", scopeA, keyA, "m", "", at)
+	firstID := testCaptureID("rollback-first")
+	first := captureAt(firstID, scopeA, keyA, "m", "", at)
 	if err := store.AppendCapture(ctx, first, CaptureBodies{RequestBody: []byte("keep-me")}); err != nil {
 		t.Fatalf("AppendCapture(first): %v", err)
 	}
 
 	// A duplicate summary aborts the whole append: no body row and no key row of the
 	// rejected capture may survive.
-	duplicate := captureAt("sess", "req", scopeB, keyB, "other", "", at.Add(time.Second))
+	duplicate := captureAt(firstID, scopeB, keyB, "other", "", at.Add(time.Second))
 	err := store.AppendCapture(ctx, duplicate, CaptureBodies{RequestBody: []byte("retry-must-not-win")})
 	if err == nil {
 		t.Fatal("AppendCapture with a duplicate summary succeeded, want constraint error")
@@ -201,23 +215,19 @@ func TestSQLiteAppendCaptureRollsBackAsOneUnit(t *testing.T) {
 	if got := countClientKeys(t, store); got != 1 {
 		t.Fatalf("failed append stored %d client keys, want 1", got)
 	}
-	detail, err := store.RecordDetail(ctx, "sess", "req")
+	detail, err := store.RecordDetail(ctx, firstID)
 	if err != nil {
 		t.Fatalf("RecordDetail: %v", err)
 	}
 	if detail.Record.Model != "m" || string(detail.Bodies.RequestBody) != "keep-me" {
 		t.Fatalf("the stored capture changed: %+v %q", detail.Record, detail.Bodies.RequestBody)
 	}
-	var rejected int
-	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM client_keys WHERE key_id = ?", scopeB).Scan(&rejected); err != nil {
-		t.Fatalf("count rejected scope: %v", err)
-	}
-	if rejected != 0 {
-		t.Fatalf("the rolled back append wrote %d key rows of the rejected scope", rejected)
+	if _, ok := clientKeyInShard(t, store, 0, scopeB); ok {
+		t.Fatal("the rolled back append wrote a key row of the rejected scope")
 	}
 
 	// The same scope and key are written once the summary no longer collides.
-	if err := store.AppendCapture(ctx, captureAt("sess", "req-2", scopeB, keyB, "m", "", at.Add(2*time.Second)), CaptureBodies{}); err != nil {
+	if err := store.AppendCapture(ctx, captureAt(testCaptureID("rollback-second"), scopeB, keyB, "m", "", at.Add(2*time.Second)), CaptureBodies{}); err != nil {
 		t.Fatalf("AppendCapture(second): %v", err)
 	}
 	if got := countClientKeys(t, store); got != 2 {
@@ -231,6 +241,9 @@ func TestSQLiteAppendCaptureRollsBackAsOneUnit(t *testing.T) {
 	}
 }
 
+// TestSQLiteSearchRecordsFiltersPaginationAndOrder pins the filter vocabulary and
+// the ordering contract: started_at DESC, capture_id DESC, total = full match
+// count, and a page window that never repeats or skips a record.
 func TestSQLiteSearchRecordsFiltersPaginationAndOrder(t *testing.T) {
 	ctx := context.Background()
 	store, _ := openTempSQLite(t)
@@ -240,16 +253,17 @@ func TestSQLiteSearchRecordsFiltersPaginationAndOrder(t *testing.T) {
 		keyB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	)
 	base := time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC)
+	labels := []string{"a1", "a2", "b1", "c1", "d1"}
 	seed := []Capture{
-		captureAt("sess-a", "req-1", keyA, "sk-key-a-0123456789", "gpt-5", "gpt-5", base),
-		captureAt("sess-a", "req-2", keyA, "sk-key-a-0123456789", "claude-sonnet", "claude-sonnet-4", base.Add(time.Second)),
-		captureAt("sess-b", "req-1", keyB, "sk-key-b-9876543210", "gpt-5", "gpt-5-mini", base.Add(2*time.Second)),
-		captureAt("sess-c", "req-1", "", "", "gemini-pro", "", base.Add(3*time.Second)),
-		captureAt("sess-d", "req-1", keyA, "sk-key-a-0123456789", "", "", base.Add(4*time.Second)),
+		captureAt(testCaptureID("a1"), keyA, "sk-key-a-0123456789", "gpt-5", "gpt-5", base),
+		captureAt(testCaptureID("a2"), keyA, "sk-key-a-0123456789", "claude-sonnet", "claude-sonnet-4", base.Add(time.Second)),
+		captureAt(testCaptureID("b1"), keyB, "sk-key-b-9876543210", "gpt-5", "gpt-5-mini", base.Add(2*time.Second)),
+		captureAt(testCaptureID("c1"), "", "", "gemini-pro", "", base.Add(3*time.Second)),
+		captureAt(testCaptureID("d1"), keyA, "sk-key-a-0123456789", "", "", base.Add(4*time.Second)),
 	}
 	for i, c := range seed {
 		if err := store.AppendCapture(ctx, c, CaptureBodies{RequestBody: []byte(fmt.Sprintf("body-%d", i))}); err != nil {
-			t.Fatalf("AppendCapture(%s/%s): %v", c.SessionID, c.RequestID, err)
+			t.Fatalf("AppendCapture(%s): %v", c.CaptureID, err)
 		}
 	}
 
@@ -263,63 +277,54 @@ func TestSQLiteSearchRecordsFiltersPaginationAndOrder(t *testing.T) {
 	if all.Page != 1 || all.PageSize != 10 {
 		t.Fatalf("page echo = %d/%d", all.Page, all.PageSize)
 	}
-	wantOrder := []string{"sess-d/req-1", "sess-c/req-1", "sess-b/req-1", "sess-a/req-2", "sess-a/req-1"}
+	wantOrder := []string{labels[4], labels[3], labels[2], labels[1], labels[0]}
 	for i, want := range wantOrder {
-		if got := all.Items[i].SessionID + "/" + all.Items[i].RequestID; got != want {
-			t.Fatalf("order[%d] = %s, want %s (newest first)", i, got, want)
+		if got := all.Items[i].CaptureID; got != testCaptureID(want) {
+			t.Fatalf("order[%d] = %s, want %s (newest first)", i, got, testCaptureID(want))
 		}
 	}
 
-	// Stable tie-break: identical started_at must order by session_id DESC then
-	// request_id DESC, and paging across the boundary must not repeat or skip.
+	// Stable tie-break: identical started_at must order by capture_id DESC, and
+	// paging across the boundary must not repeat or skip.
 	tie := base.Add(10 * time.Second)
-	for _, pair := range [][2]string{{"sess-tie", "req-a"}, {"sess-tie", "req-b"}, {"sess-tie-2", "req-a"}} {
-		c := captureAt(pair[0], pair[1], keyB, "sk-key-b-9876543210", "gpt-5", "", tie)
+	tieLabels := []string{"tie-a", "tie-b", "tie-c"}
+	tieIDs := make([]string, 0, len(tieLabels))
+	for _, label := range tieLabels {
+		id := testCaptureID(label)
+		tieIDs = append(tieIDs, id)
+		c := captureAt(id, keyB, "sk-key-b-9876543210", "gpt-5", "", tie)
 		if err := store.AppendCapture(ctx, c, CaptureBodies{}); err != nil {
-			t.Fatalf("AppendCapture(tie %v): %v", pair, err)
+			t.Fatalf("AppendCapture(tie %s): %v", label, err)
 		}
 	}
-	page1, err := store.SearchRecords(ctx, RecordFilter{Page: 1, PageSize: 2})
-	if err != nil {
-		t.Fatalf("SearchRecords(page 1): %v", err)
-	}
-	page2, err := store.SearchRecords(ctx, RecordFilter{Page: 2, PageSize: 2})
-	if err != nil {
-		t.Fatalf("SearchRecords(page 2): %v", err)
-	}
-	page3, err := store.SearchRecords(ctx, RecordFilter{Page: 3, PageSize: 2})
-	if err != nil {
-		t.Fatalf("SearchRecords(page 3): %v", err)
-	}
-	page4, err := store.SearchRecords(ctx, RecordFilter{Page: 4, PageSize: 2})
-	if err != nil {
-		t.Fatalf("SearchRecords(page 4): %v", err)
-	}
-	if page1.Total != 8 || page2.Total != 8 || page3.Total != 8 || page4.Total != 8 {
-		t.Fatalf("total must be the full match count: %d %d %d %d", page1.Total, page2.Total, page3.Total, page4.Total)
-	}
-	var paged []string
-	for _, page := range []RecordPage{page1, page2, page3, page4} {
-		for _, item := range page.Items {
-			paged = append(paged, item.SessionID+"/"+item.RequestID)
+	sort.Sort(sort.Reverse(sort.StringSlice(tieIDs)))
+
+	var paged []Capture
+	for page := 1; page <= 4; page++ {
+		got, err := store.SearchRecords(ctx, RecordFilter{Page: page, PageSize: 2})
+		if err != nil {
+			t.Fatalf("SearchRecords(page %d): %v", page, err)
 		}
+		if got.Total != 8 {
+			t.Fatalf("page %d total = %d, want the full match count 8", page, got.Total)
+		}
+		paged = append(paged, got.Items...)
 	}
 	if len(paged) != 8 {
-		t.Fatalf("paging returned %d records, want 8: %v", len(paged), paged)
+		t.Fatalf("paging returned %d records, want 8", len(paged))
+	}
+	for i, want := range tieIDs {
+		if paged[i].CaptureID != want {
+			t.Fatalf("tie order[%d] = %s, want %s", i, paged[i].CaptureID, want)
+		}
 	}
 	for i := 1; i < len(paged); i++ {
-		if paged[i-1] == paged[i] {
-			t.Fatalf("paging repeated %s", paged[i])
+		if paged[i-1].CaptureID == paged[i].CaptureID {
+			t.Fatalf("paging repeated %s", paged[i].CaptureID)
 		}
-	}
-	wantTie := []string{"sess-tie-2/req-a", "sess-tie/req-b", "sess-tie/req-a"}
-	for i, want := range wantTie {
-		if paged[i] != want {
-			t.Fatalf("tie order[%d] = %s, want %s", i, paged[i], want)
+		if paged[i].StartedAt.After(paged[i-1].StartedAt) {
+			t.Fatalf("paging returned %s before %s", paged[i].StartedAt, paged[i-1].StartedAt)
 		}
-	}
-	if len(page4.Items) != 2 {
-		t.Fatalf("page 4 returned %d items, want 2", len(page4.Items))
 	}
 	past, err := store.SearchRecords(ctx, RecordFilter{Page: 5, PageSize: 2})
 	if err != nil {
@@ -346,8 +351,8 @@ func TestSQLiteSearchRecordsFiltersPaginationAndOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchRecords(unknown key): %v", err)
 	}
-	if unknown.Total != 1 || len(unknown.Items) != 1 || unknown.Items[0].SessionID != "sess-c" {
-		t.Fatalf("unknown key matched %+v, want sess-c/req-1 only", unknown.Items)
+	if unknown.Total != 1 || len(unknown.Items) != 1 || unknown.Items[0].CaptureID != testCaptureID("c1") {
+		t.Fatalf("unknown key matched %+v, want the scope-less capture only", unknown.Items)
 	}
 
 	// Model filter matches model OR requested_model, exactly.
@@ -355,21 +360,30 @@ func TestSQLiteSearchRecordsFiltersPaginationAndOrder(t *testing.T) {
 		model string
 		want  []string
 	}{
-		{"gpt-5", []string{"sess-tie-2/req-a", "sess-tie/req-b", "sess-tie/req-a", "sess-b/req-1", "sess-a/req-1"}},
-		{"gpt-5-mini", []string{"sess-b/req-1"}},
-		{"claude-sonnet-4", []string{"sess-a/req-2"}},
+		{"gpt-5", []string{labels[2], labels[0]}},
+		{"gpt-5-mini", []string{labels[2]}},
+		{"claude-sonnet-4", []string{labels[1]}},
 		{"gpt", nil},
 	} {
 		got, err := store.SearchRecords(ctx, RecordFilter{Model: tc.model, Page: 1, PageSize: 10})
 		if err != nil {
 			t.Fatalf("SearchRecords(model %s): %v", tc.model, err)
 		}
-		if int(got.Total) != len(tc.want) {
-			t.Fatalf("model %q matched %d records, want %d", tc.model, got.Total, len(tc.want))
+		// The three tie records also carry gpt-5.
+		extra := 0
+		if tc.model == "gpt-5" {
+			extra = 3
+		}
+		if int(got.Total) != len(tc.want)+extra {
+			t.Fatalf("model %q matched %d records, want %d", tc.model, got.Total, len(tc.want)+extra)
 		}
 		for i, want := range tc.want {
-			if item := got.Items[i].SessionID + "/" + got.Items[i].RequestID; item != want {
-				t.Fatalf("model %q item %d = %s, want %s", tc.model, i, item, want)
+			offset := 0
+			if tc.model == "gpt-5" {
+				offset = 3
+			}
+			if item := got.Items[i+offset].CaptureID; item != testCaptureID(want) {
+				t.Fatalf("model %q item %d = %s, want %s", tc.model, i, item, testCaptureID(want))
 			}
 		}
 	}
@@ -410,8 +424,103 @@ func TestSQLiteSearchRecordsFiltersPaginationAndOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchRecords(combined 2): %v", err)
 	}
-	if combined.Total != 1 || combined.Items[0].RequestID != "req-2" {
+	if combined.Total != 1 || combined.Items[0].CaptureID != testCaptureID("a2") {
 		t.Fatalf("combined filter matched %+v", combined.Items)
+	}
+}
+
+// TestSQLiteSearchRecordsMergesShards proves that a sharded store serves one
+// globally ordered list: the records are spread over several shards, yet every
+// page is a window of the same total order, with no duplicate and no gap.
+func TestSQLiteSearchRecordsMergesShards(t *testing.T) {
+	ctx := context.Background()
+	const writerCount = 4
+	store, _ := openTempSQLiteShards(t, writerCount)
+
+	base := time.Date(2026, 11, 12, 13, 14, 15, 0, time.UTC)
+	const records = 61
+	for i := 0; i < records; i++ {
+		id := testCaptureID(fmt.Sprintf("merge-%03d", i))
+		at := base.Add(time.Duration(i) * time.Second)
+		c := captureAt(id, "scope-merge", "", fmt.Sprintf("model-%d", i%3), "", at)
+		if err := store.AppendCapture(ctx, c, CaptureBodies{RequestBody: []byte(fmt.Sprintf("body-%03d", i))}); err != nil {
+			t.Fatalf("AppendCapture(%d): %v", i, err)
+		}
+	}
+	if got := countCaptures(t, store); got != records {
+		t.Fatalf("stored %d captures, want %d", got, records)
+	}
+	// Every shard must really hold records, otherwise the merge is not exercised.
+	used := 0
+	for _, db := range shardDBs(store) {
+		var n int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM captures").Scan(&n); err != nil {
+			t.Fatalf("count shard: %v", err)
+		}
+		if n > 0 {
+			used++
+		}
+	}
+	if used != writerCount {
+		t.Fatalf("%d of %d shards hold records; the distribution is not spread", used, writerCount)
+	}
+
+	// One big page defines the expected global order.
+	whole, err := store.SearchRecords(ctx, RecordFilter{Page: 1, PageSize: MaxPageSize})
+	if err != nil {
+		t.Fatalf("SearchRecords(whole): %v", err)
+	}
+	if whole.Total != records || len(whole.Items) != records {
+		t.Fatalf("whole page: total %d, %d items, want %d", whole.Total, len(whole.Items), records)
+	}
+	for i := 1; i < len(whole.Items); i++ {
+		prev, cur := whole.Items[i-1], whole.Items[i]
+		if cur.StartedAt.After(prev.StartedAt) {
+			t.Fatalf("order[%d] started after order[%d]", i, i-1)
+		}
+		if cur.StartedAt.Equal(prev.StartedAt) && cur.CaptureID > prev.CaptureID {
+			t.Fatalf("tie order[%d] = %s > %s", i, cur.CaptureID, prev.CaptureID)
+		}
+	}
+
+	// Paging with a small page size must reproduce exactly that order.
+	const pageSize = 7
+	var paged []Capture
+	for page := 1; ; page++ {
+		got, err := store.SearchRecords(ctx, RecordFilter{Page: page, PageSize: pageSize})
+		if err != nil {
+			t.Fatalf("SearchRecords(page %d): %v", page, err)
+		}
+		if got.Total != records {
+			t.Fatalf("page %d total = %d, want %d", page, got.Total, records)
+		}
+		if len(got.Items) == 0 {
+			break
+		}
+		paged = append(paged, got.Items...)
+		if page > records {
+			t.Fatal("paging did not terminate")
+		}
+	}
+	if len(paged) != records {
+		t.Fatalf("paging returned %d records, want %d", len(paged), records)
+	}
+	for i := range paged {
+		if paged[i].CaptureID != whole.Items[i].CaptureID {
+			t.Fatalf("paged[%d] = %s, want %s", i, paged[i].CaptureID, whole.Items[i].CaptureID)
+		}
+	}
+
+	// The bodies of every record are reachable by ID alone, across shards.
+	for i := 0; i < records; i++ {
+		id := testCaptureID(fmt.Sprintf("merge-%03d", i))
+		detail, err := store.RecordDetail(ctx, id)
+		if err != nil {
+			t.Fatalf("RecordDetail(%s): %v", id, err)
+		}
+		if want := fmt.Sprintf("body-%03d", i); string(detail.Bodies.RequestBody) != want {
+			t.Fatalf("bodies of %s = %q, want %q", id, detail.Bodies.RequestBody, want)
+		}
 	}
 }
 
@@ -421,13 +530,14 @@ func TestSQLiteSearchRecordsValidation(t *testing.T) {
 	now := time.Now().UTC()
 
 	cases := map[string]RecordFilter{
-		"page zero":        {Page: 0, PageSize: 10},
-		"page negative":    {Page: -1, PageSize: 10},
-		"page size zero":   {Page: 1, PageSize: 0},
-		"page size over":   {Page: 1, PageSize: MaxPageSize + 1},
-		"page size huge":   {Page: 1, PageSize: 100000},
-		"from after to":    {From: now.Add(time.Hour), To: now, Page: 1, PageSize: 10},
-		"from equal to to": {From: now, To: now, Page: 1, PageSize: 10},
+		"page zero":             {Page: 0, PageSize: 10},
+		"page negative":         {Page: -1, PageSize: 10},
+		"page size zero":        {Page: 1, PageSize: 0},
+		"page size over":        {Page: 1, PageSize: MaxPageSize + 1},
+		"page size huge":        {Page: 1, PageSize: 100000},
+		"from after to":         {From: now.Add(time.Hour), To: now, Page: 1, PageSize: 10},
+		"from equal to to":      {From: now, To: now, Page: 1, PageSize: 10},
+		"page offset too large": {Page: 1 << 30, PageSize: MaxPageSize},
 	}
 	for name, filter := range cases {
 		if _, err := store.SearchRecords(ctx, filter); err == nil {
@@ -443,8 +553,8 @@ func TestSQLiteSearchRecordsValidation(t *testing.T) {
 	if _, err := store.SearchRecords(ctx, RecordFilter{To: now, Page: 1, PageSize: 10}); err != nil {
 		t.Errorf("SearchRecords(to only): %v", err)
 	}
-	if _, err := store.RecordDetail(ctx, "  ", "x"); err == nil {
-		t.Fatal("RecordDetail with a blank session ID succeeded, want error")
+	if _, err := store.RecordDetail(ctx, "   "); err == nil {
+		t.Fatal("RecordDetail with a blank capture ID succeeded, want error")
 	}
 }
 
@@ -459,20 +569,20 @@ func TestSQLiteRecordOptionsMasksKeysAndListsModels(t *testing.T) {
 		shortKey  = "sk-12345"
 	)
 	seed := []Capture{
-		captureAt("s1", "r1", "id-long", "", "gpt-5", "gpt-5-mini", base),
-		captureAt("s2", "r1", "id-medium", "", "claude-sonnet-4", "", base.Add(time.Second)),
-		captureAt("s3", "r1", "id-short", "", "gemini-pro", "gemini-pro-exp", base.Add(2*time.Second)),
-		captureAt("s4", "r1", "unknown", "", "gpt-5", "", base.Add(3*time.Second)),
+		captureAt(testCaptureID("o1"), "id-long", "", "gpt-5", "gpt-5-mini", base),
+		captureAt(testCaptureID("o2"), "id-medium", "", "claude-sonnet-4", "", base.Add(time.Second)),
+		captureAt(testCaptureID("o3"), "id-short", "", "gemini-pro", "gemini-pro-exp", base.Add(2*time.Second)),
+		captureAt(testCaptureID("o4"), "unknown", "", "gpt-5", "", base.Add(3*time.Second)),
 	}
 	for _, c := range seed {
 		if err := store.AppendCapture(ctx, c, CaptureBodies{}); err != nil {
-			t.Fatalf("AppendCapture(%s): %v", c.SessionID, err)
+			t.Fatalf("AppendCapture(%s): %v", c.CaptureID, err)
 		}
 	}
 	// The plugin sends the literal "unknown" when the host exposes no key metadata:
 	// it must land in the unknown group and never create a key row, even when a
 	// plaintext is supplied by mistake.
-	if err := store.AppendCapture(ctx, captureAt("s5", "r1", UnknownKeyID, "sk-ignored-0123456789", "gpt-5", "", base.Add(4*time.Second)), CaptureBodies{}); err != nil {
+	if err := store.AppendCapture(ctx, captureAt(testCaptureID("o5"), UnknownKeyID, "sk-ignored-0123456789", "gpt-5", "", base.Add(4*time.Second)), CaptureBodies{}); err != nil {
 		t.Fatalf("AppendCapture(unknown scope): %v", err)
 	}
 
@@ -554,12 +664,107 @@ func TestSQLiteRecordOptionsMasksKeysAndListsModels(t *testing.T) {
 	}
 }
 
+// TestSQLiteRecordOptionsMergesShards proves that the filter vocabulary is the
+// union of the shards: a scope or model that only occurs in one shard is still
+// selectable, and a key that arrives late is visible in every shard.
+func TestSQLiteRecordOptionsMergesShards(t *testing.T) {
+	ctx := context.Background()
+	const writerCount = 4
+	store, _ := openTempSQLiteShards(t, writerCount)
+
+	const (
+		lateScope = "cafe11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff001122"
+		lateKey   = "sk-late-usage-key-0123456789"
+	)
+	base := time.Date(2026, 12, 13, 14, 15, 16, 0, time.UTC)
+	const records = 40
+	for i := 0; i < records; i++ {
+		id := testCaptureID(fmt.Sprintf("options-%03d", i))
+		scope := fmt.Sprintf("scope-%d", i%3)
+		if i%7 == 0 {
+			scope = lateScope
+		}
+		c := captureAt(id, scope, "", fmt.Sprintf("model-%d", i%4), "", base.Add(time.Duration(i)*time.Second))
+		if err := store.AppendCapture(ctx, c, CaptureBodies{}); err != nil {
+			t.Fatalf("AppendCapture(%d): %v", i, err)
+		}
+	}
+
+	// Every scope is unresolved until the plaintext arrives, but must be listed as
+	// its own option instead of being folded into the unknown group.
+	options, err := store.RecordOptions(ctx)
+	if err != nil {
+		t.Fatalf("RecordOptions: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, k := range options.Keys {
+		ids[k.ID] = true
+	}
+	for _, scope := range []string{"scope-0", "scope-1", "scope-2", lateScope} {
+		if !ids[scope] {
+			t.Fatalf("scope %s is missing from the merged options: %+v", scope, options.Keys)
+		}
+	}
+	if ids[UnknownKeyID] {
+		t.Fatalf("no capture is scope-less, yet the unknown option is offered: %+v", options.Keys)
+	}
+	if len(options.Models) != 4 {
+		t.Fatalf("merged models = %v, want the 4 models of the shards", options.Models)
+	}
+
+	// A late usage key must reach every shard, so the merged label resolves.
+	if err := store.UpsertClientKey(ctx, lateScope, lateKey); err != nil {
+		t.Fatalf("UpsertClientKey(late scope): %v", err)
+	}
+	for i := 0; i < writerCount; i++ {
+		got, ok := clientKeyInShard(t, store, i, lateScope)
+		if !ok {
+			t.Fatalf("shard %d has no row for the late scope", i)
+		}
+		if got != lateKey {
+			t.Fatalf("shard %d stored %q, want %q", i, got, lateKey)
+		}
+	}
+	options, err = store.RecordOptions(ctx)
+	if err != nil {
+		t.Fatalf("RecordOptions after upsert: %v", err)
+	}
+	resolved := false
+	for _, k := range options.Keys {
+		if k.ID != lateScope {
+			continue
+		}
+		resolved = true
+		if k.Label == lateKey || !strings.Contains(k.Label, lateKey[:5]) {
+			t.Fatalf("late scope label = %q, want a masked key", k.Label)
+		}
+	}
+	if !resolved {
+		t.Fatalf("the late scope disappeared from the options: %+v", options.Keys)
+	}
+	// The list join resolves the plaintext in whichever shard holds the record.
+	page, err := store.SearchRecords(ctx, RecordFilter{KeyID: lateScope, Page: 1, PageSize: MaxPageSize})
+	if err != nil {
+		t.Fatalf("SearchRecords(late scope): %v", err)
+	}
+	if page.Total == 0 {
+		t.Fatal("the late scope matched no record")
+	}
+	for _, item := range page.Items {
+		if item.ClientKey != lateKey {
+			t.Fatalf("record %s did not join the late key: %q", item.CaptureID, item.ClientKey)
+		}
+	}
+}
+
 func TestSQLiteRecordJSONNeverExposesClientKey(t *testing.T) {
 	ctx := context.Background()
 	store, _ := openTempSQLite(t)
 	at := time.Date(2026, 10, 11, 12, 13, 14, 0, time.UTC)
 	const key = "sk-live-ZZZZ0123456789abcdefghijkl"
-	capture := captureAt("sess-json", "req-json", "id-json", key, "gpt-5", "gpt-5-mini", at)
+	captureID := testCaptureID("json")
+	capture := captureAt(captureID, "id-json", key, "gpt-5", "gpt-5-mini", at)
+	capture.RequestID = "host-request-verbatim-42"
 	if err := store.AppendCapture(ctx, capture, CaptureBodies{RequestBody: binaryPayload(), ResponseBody: []byte("resp")}); err != nil {
 		t.Fatalf("AppendCapture: %v", err)
 	}
@@ -568,7 +773,7 @@ func TestSQLiteRecordJSONNeverExposesClientKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchRecords: %v", err)
 	}
-	detail, err := store.RecordDetail(ctx, "sess-json", "req-json")
+	detail, err := store.RecordDetail(ctx, captureID)
 	if err != nil {
 		t.Fatalf("RecordDetail: %v", err)
 	}
@@ -598,6 +803,24 @@ func TestSQLiteRecordJSONNeverExposesClientKey(t *testing.T) {
 	}
 	if page.Items[0].ClientKeyID != "id-json" || detail.Record.Model != "gpt-5" {
 		t.Fatalf("unexpected record: %+v / %+v", page.Items[0], detail.Record)
+	}
+	// The summary serialises the capture ID and the host request ID exactly as the
+	// host reported it; there is no session identity and no digest that would hide
+	// the host's own identifier.
+	encoded, err := json.Marshal(detail.Record)
+	if err != nil {
+		t.Fatalf("marshal record: %v", err)
+	}
+	for _, field := range []string{`"capture_id":`, `"request_id":`} {
+		if !bytes.Contains(encoded, []byte(field)) {
+			t.Fatalf("record JSON is missing %s: %s", field, encoded)
+		}
+	}
+	if !bytes.Contains(encoded, []byte(capture.RequestID)) {
+		t.Fatalf("record JSON does not carry the host request ID verbatim (%q): %s", capture.RequestID, encoded)
+	}
+	if bytes.Contains(encoded, []byte(`"session_id":`)) {
+		t.Fatalf("record JSON still exposes a session identity: %s", encoded)
 	}
 }
 
@@ -674,16 +897,16 @@ func TestSQLiteUpsertClientKeyFillsOnlyTheScope(t *testing.T) {
 	// Three captures of scope A and one of scope B were stored while the plaintext
 	// was still unknown; scope C already had it; one record has no scope at all.
 	seed := []Capture{
-		captureAt("s-a1", "r1", scopeA, "", "gpt-5", "", base),
-		captureAt("s-a2", "r1", scopeA, "", "gpt-5", "", base.Add(time.Second)),
-		captureAt("s-a3", "r1", scopeA, "", "claude-sonnet", "", base.Add(2*time.Second)),
-		captureAt("s-b1", "r1", scopeB, "", "gpt-5", "", base.Add(3*time.Second)),
-		captureAt("s-c1", "r1", scopeC, keyC, "gpt-5", "", base.Add(4*time.Second)),
-		captureAt("s-u1", "r1", "unknown", "", "gpt-5", "", base.Add(5*time.Second)),
+		captureAt(testCaptureID("k-a1"), scopeA, "", "gpt-5", "", base),
+		captureAt(testCaptureID("k-a2"), scopeA, "", "gpt-5", "", base.Add(time.Second)),
+		captureAt(testCaptureID("k-a3"), scopeA, "", "claude-sonnet", "", base.Add(2*time.Second)),
+		captureAt(testCaptureID("k-b1"), scopeB, "", "gpt-5", "", base.Add(3*time.Second)),
+		captureAt(testCaptureID("k-c1"), scopeC, keyC, "gpt-5", "", base.Add(4*time.Second)),
+		captureAt(testCaptureID("k-u1"), "unknown", "", "gpt-5", "", base.Add(5*time.Second)),
 	}
 	for _, c := range seed {
 		if err := store.AppendCapture(ctx, c, CaptureBodies{}); err != nil {
-			t.Fatalf("AppendCapture(%s): %v", c.SessionID, err)
+			t.Fatalf("AppendCapture(%s): %v", c.CaptureID, err)
 		}
 	}
 	before := countCaptures(t, store)
@@ -722,12 +945,8 @@ func TestSQLiteUpsertClientKeyFillsOnlyTheScope(t *testing.T) {
 	if after := countCaptures(t, store); after != before {
 		t.Fatalf("UpsertClientKey changed the capture count: %d -> %d (it must never insert)", before, after)
 	}
-	var emptyScopeB int
-	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM client_keys WHERE key_id = ?", scopeB).Scan(&emptyScopeB); err != nil {
-		t.Fatalf("count scope B keys: %v", err)
-	}
-	if emptyScopeB != 0 {
-		t.Fatalf("scope B gained %d key rows, want 0", emptyScopeB)
+	if _, ok := clientKeyInShard(t, store, 0, scopeB); ok {
+		t.Fatal("scope B gained a key row, want none")
 	}
 
 	// The label now masks the upserted key and never shows it in full.
@@ -766,7 +985,7 @@ func TestSQLiteUpsertClientKeyFillsOnlyTheScope(t *testing.T) {
 	if page.Total != 3 {
 		t.Fatalf("scope A matched %d records, want 3", page.Total)
 	}
-	detail, err := store.RecordDetail(ctx, "s-a1", "r1")
+	detail, err := store.RecordDetail(ctx, testCaptureID("k-a1"))
 	if err != nil {
 		t.Fatalf("RecordDetail: %v", err)
 	}
@@ -827,16 +1046,17 @@ func TestSQLiteUpsertClientKeyUpdatesOnlyWhenDifferentAndNeverRewritesCaptures(t
 		key2  = "sk-second-key-9876543210"
 	)
 	at := time.Date(2027, 5, 6, 7, 8, 9, 0, time.UTC)
-	if err := store.AppendCapture(ctx, captureAt("sess", "req", scope, key1, "gpt-5", "gpt-5-mini", at), CaptureBodies{RequestBody: []byte("body")}); err != nil {
+	captureID := testCaptureID("key-update")
+	if err := store.AppendCapture(ctx, captureAt(captureID, scope, key1, "gpt-5", "gpt-5-mini", at), CaptureBodies{RequestBody: []byte("body")}); err != nil {
 		t.Fatalf("AppendCapture: %v", err)
 	}
 
 	snapshot := func() string {
 		t.Helper()
 		var row string
-		if err := store.db.QueryRowContext(ctx,
-			"SELECT client_key_id || '|' || model || '|' || requested_model || '|' || event_count || '|' || started_at_us || '|' || completed_at_us FROM captures WHERE session_id = ? AND request_id = ?",
-			"sess", "req").Scan(&row); err != nil {
+		if err := store.shards[0].db.QueryRowContext(ctx,
+			"SELECT client_key_id || '|' || model || '|' || requested_model || '|' || event_count || '|' || started_at_us || '|' || completed_at_us FROM captures WHERE capture_id = ?",
+			mustCaptureIDBytes(t, captureID)).Scan(&row); err != nil {
 			t.Fatalf("snapshot capture: %v", err)
 		}
 		return row
@@ -865,7 +1085,7 @@ func TestSQLiteUpsertClientKeyUpdatesOnlyWhenDifferentAndNeverRewritesCaptures(t
 	if after := snapshot(); after != before {
 		t.Fatalf("upserting a key rewrote the historical capture:\n before %s\n after  %s", before, after)
 	}
-	detail, err := store.RecordDetail(ctx, "sess", "req")
+	detail, err := store.RecordDetail(ctx, captureID)
 	if err != nil {
 		t.Fatalf("RecordDetail: %v", err)
 	}
@@ -881,5 +1101,200 @@ func TestSQLiteUpsertClientKeyUpdatesOnlyWhenDifferentAndNeverRewritesCaptures(t
 		if k.ID == scope && (k.Label == key2 || !strings.Contains(k.Label, key2[:5])) {
 			t.Fatalf("scope label = %q, want the masked new key", k.Label)
 		}
+	}
+}
+
+// mustCaptureIDBytes is the raw form of a test capture ID.
+func mustCaptureIDBytes(t *testing.T, id string) []byte {
+	t.Helper()
+	raw, err := ParseCaptureID(id)
+	if err != nil {
+		t.Fatalf("ParseCaptureID(%s): %v", id, err)
+	}
+	return raw
+}
+
+// TestSQLiteCaptureIDIsUniqueAndRandom pins the identity contract of the plugin:
+// two generated IDs differ, and each is 32 lowercase hex characters describing 16
+// bytes.
+func TestSQLiteCaptureIDIsUniqueAndRandom(t *testing.T) {
+	const draws = 4096
+	seen := make(map[string]bool, draws)
+	for i := 0; i < draws; i++ {
+		id, err := NewCaptureID()
+		if err != nil {
+			t.Fatalf("NewCaptureID: %v", err)
+		}
+		if len(id) != CaptureIDHexLen {
+			t.Fatalf("NewCaptureID returned %d characters, want %d", len(id), CaptureIDHexLen)
+		}
+		if strings.ToLower(id) != id {
+			t.Fatalf("NewCaptureID returned %q, want lowercase hex", id)
+		}
+		if seen[id] {
+			t.Fatalf("NewCaptureID repeated %s", id)
+		}
+		seen[id] = true
+		raw, err := ParseCaptureID(id)
+		if err != nil {
+			t.Fatalf("ParseCaptureID(%s): %v", id, err)
+		}
+		if len(raw) != captureIDBytesLen {
+			t.Fatalf("ParseCaptureID(%s) returned %d bytes, want %d", id, len(raw), captureIDBytesLen)
+		}
+	}
+	for _, bad := range []string{"", "   ", "0", strings.Repeat("a", CaptureIDHexLen-1), strings.Repeat("a", CaptureIDHexLen+1), strings.Repeat("z", CaptureIDHexLen)} {
+		if _, err := ParseCaptureID(bad); err == nil {
+			t.Errorf("ParseCaptureID(%q) succeeded, want error", bad)
+		}
+	}
+	// Uppercase hex names the same capture.
+	upper := strings.ToUpper(seen0(t, seen))
+	raw, err := ParseCaptureID(upper)
+	if err != nil {
+		t.Fatalf("ParseCaptureID(%s): %v", upper, err)
+	}
+	if got := formatCaptureID(raw); got != strings.ToLower(upper) {
+		t.Fatalf("formatCaptureID = %q, want %q", got, strings.ToLower(upper))
+	}
+}
+
+// seen0 returns any key of the set; it exists to avoid iterating a map in the test
+// above without a defined order.
+func seen0(t *testing.T, set map[string]bool) string {
+	t.Helper()
+	for id := range set {
+		return id
+	}
+	t.Fatal("empty set")
+	return ""
+}
+
+// TestShardIndexIsStableAndSpreads pins the fixed mapping recorded in the manifest.
+func TestShardIndexIsStableAndSpreads(t *testing.T) {
+	const shards = 4
+	counts := make([]int, shards)
+	for i := 0; i < 64; i++ {
+		raw := mustCaptureIDBytes(t, testCaptureID(fmt.Sprintf("spread-%02d", i)))
+		index := shardIndex(raw, shards)
+		if index < 0 || index >= shards {
+			t.Fatalf("shardIndex = %d, want 0..%d", index, shards-1)
+		}
+		// The mapping must be a pure function of the ID.
+		if again := shardIndex(raw, shards); again != index {
+			t.Fatalf("shardIndex is not stable: %d then %d", index, again)
+		}
+		counts[index]++
+	}
+	for index, n := range counts {
+		if n == 0 {
+			t.Fatalf("shard %d never received a record of 64: %v", index, counts)
+		}
+	}
+	// A single shard always maps to 0, whatever the ID.
+	if got := shardIndex(mustCaptureIDBytes(t, testCaptureID("single")), 1); got != 0 {
+		t.Fatalf("shardIndex(id, 1) = %d, want 0", got)
+	}
+}
+
+// TestSQLiteSearchWindowIsCappedForShardedStores pins the merge window limit. A
+// sharded store has no global index, so it reads every shard from the top and
+// materialises up to shards*(offset+limit) rows for one page; a window deeper than
+// MaxSearchWindow is refused instead of being served at an unbounded cost. A store
+// with a single database pushes the offset into the query, so it stays unlimited.
+func TestSQLiteSearchWindowIsCappedForShardedStores(t *testing.T) {
+	ctx := context.Background()
+
+	sharded, _ := openTempSQLiteShards(t, 4)
+	t.Cleanup(func() { _ = sharded.Close() })
+
+	// The last allowed page of the maximum page size ends exactly at the window.
+	edge := MaxSearchWindow / MaxPageSize
+	if _, err := sharded.SearchRecords(ctx, RecordFilter{Page: edge, PageSize: MaxPageSize}); err != nil {
+		t.Fatalf("SearchRecords at the window edge (page %d): %v", edge, err)
+	}
+	_, err := sharded.SearchRecords(ctx, RecordFilter{Page: edge + 1, PageSize: MaxPageSize})
+	if !errors.Is(err, ErrSearchWindowTooDeep) {
+		t.Fatalf("SearchRecords past the window error = %v, want ErrSearchWindowTooDeep", err)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprint(MaxSearchWindow)) {
+		t.Fatalf("window error %q must name the limit %d", err, MaxSearchWindow)
+	}
+	// The same page is fine once the filters narrow it: the window counts rows, not
+	// pages, so a smaller page size reaches further.
+	if _, err := sharded.SearchRecords(ctx, RecordFilter{Page: edge * 2, PageSize: MaxPageSize / 2}); err != nil {
+		t.Fatalf("SearchRecords with a narrower page: %v", err)
+	}
+
+	single, _ := openTempSQLite(t)
+	t.Cleanup(func() { _ = single.Close() })
+	page, err := single.SearchRecords(ctx, RecordFilter{Page: 5000, PageSize: MaxPageSize})
+	if err != nil {
+		t.Fatalf("single-database deep page: %v", err)
+	}
+	if len(page.Items) != 0 || page.Total != 0 {
+		t.Fatalf("single-database deep page = %d items / total %d, want 0 / 0", len(page.Items), page.Total)
+	}
+}
+
+// TestSQLiteKeyReplicationAttemptsEveryShard breaks two shards of a four-shard
+// store and requires AppendCapture to keep going: the capture itself must still be
+// stored, the remaining healthy shard must still receive the key even though the
+// earlier shards failed, and the failures must come back as ErrKeyIncomplete so the
+// key stays eligible for a retry instead of the capture being counted as lost.
+func TestSQLiteKeyReplicationAttemptsEveryShard(t *testing.T) {
+	ctx := context.Background()
+	store, _ := openTempSQLiteShards(t, 4)
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Route the capture to shard 3 so the fan-out has to cross the broken shards.
+	var captureID string
+	for i := 0; i < 256 && captureID == ""; i++ {
+		candidate := testCaptureID(fmt.Sprintf("fanout-%d", i))
+		if shardIndex(mustCaptureIDBytes(t, candidate), 4) == 3 {
+			captureID = candidate
+		}
+	}
+	if captureID == "" {
+		t.Fatal("no test capture ID mapped to shard 3")
+	}
+	for _, index := range []int{0, 1} {
+		if err := store.shards[index].db.Close(); err != nil {
+			t.Fatalf("close shard %d: %v", index, err)
+		}
+	}
+
+	startedAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	capture := captureAt(captureID, "scope-fanout", "sk-fanout-secret", "gpt-fanout", "", startedAt)
+	err := store.AppendCapture(ctx, capture, CaptureBodies{RequestBody: []byte("fanout-body")})
+	if !errors.Is(err, ErrKeyIncomplete) {
+		t.Fatalf("AppendCapture error = %v, want ErrKeyIncomplete", err)
+	}
+	// Both broken shards are reported: the fan-out did not stop at the first one.
+	for _, index := range []int{0, 1} {
+		if !strings.Contains(err.Error(), fmt.Sprintf("shard %d", index)) {
+			t.Errorf("error %q does not report shard %d", err, index)
+		}
+	}
+	// The capture is stored: it is readable by ID alone, body included.
+	detail, err := store.RecordDetail(ctx, captureID)
+	if err != nil {
+		t.Fatalf("RecordDetail(%s): %v", captureID, err)
+	}
+	if got := string(detail.Bodies.RequestBody); got != "fanout-body" {
+		t.Fatalf("stored body = %q, want %q", got, "fanout-body")
+	}
+	// Shard 2 is only reached after both failures, so its key proves the loop kept
+	// going; shard 3 got the key inside the append transaction.
+	for _, index := range []int{2, 3} {
+		got, ok := clientKeyInShard(t, store, index, "scope-fanout")
+		if !ok || got != "sk-fanout-secret" {
+			t.Fatalf("shard %d key = %q (present %v), want sk-fanout-secret", index, got, ok)
+		}
+	}
+	// The write is idempotent: once the shards are healthy again the same key is
+	// accepted, which is what a retry does.
+	if err := store.UpsertClientKey(ctx, "scope-fanout", "sk-fanout-secret"); err == nil {
+		t.Fatal("UpsertClientKey on broken shards must report the failure")
 	}
 }

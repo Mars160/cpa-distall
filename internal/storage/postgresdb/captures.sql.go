@@ -44,7 +44,7 @@ func (q *Queries) CountCaptures(ctx context.Context, arg CountCapturesParams) (i
 
 const getCapture = `-- name: GetCapture :one
 SELECT
-    session_id,
+    capture_id,
     request_id,
     client_key_id,
     model,
@@ -55,20 +55,14 @@ SELECT
     completed_at_us,
     event_count
 FROM captures
-WHERE session_id = $1
-  AND request_id = $2
+WHERE capture_id = $1
 `
 
-type GetCaptureParams struct {
-	SessionID string
-	RequestID string
-}
-
-func (q *Queries) GetCapture(ctx context.Context, arg GetCaptureParams) (Capture, error) {
-	row := q.db.QueryRowContext(ctx, getCapture, arg.SessionID, arg.RequestID)
+func (q *Queries) GetCapture(ctx context.Context, captureID []byte) (Capture, error) {
+	row := q.db.QueryRowContext(ctx, getCapture, captureID)
 	var i Capture
 	err := row.Scan(
-		&i.SessionID,
+		&i.CaptureID,
 		&i.RequestID,
 		&i.ClientKeyID,
 		&i.Model,
@@ -88,14 +82,8 @@ SELECT
     response_body,
     websocket_body
 FROM capture_bodies
-WHERE session_id = $1
-  AND request_id = $2
+WHERE capture_id = $1
 `
-
-type GetCaptureBodiesParams struct {
-	SessionID string
-	RequestID string
-}
 
 type GetCaptureBodiesRow struct {
 	RequestBody   []byte
@@ -103,8 +91,8 @@ type GetCaptureBodiesRow struct {
 	WebsocketBody []byte
 }
 
-func (q *Queries) GetCaptureBodies(ctx context.Context, arg GetCaptureBodiesParams) (GetCaptureBodiesRow, error) {
-	row := q.db.QueryRowContext(ctx, getCaptureBodies, arg.SessionID, arg.RequestID)
+func (q *Queries) GetCaptureBodies(ctx context.Context, captureID []byte) (GetCaptureBodiesRow, error) {
+	row := q.db.QueryRowContext(ctx, getCaptureBodies, captureID)
 	var i GetCaptureBodiesRow
 	err := row.Scan(&i.RequestBody, &i.ResponseBody, &i.WebsocketBody)
 	return i, err
@@ -113,7 +101,7 @@ func (q *Queries) GetCaptureBodies(ctx context.Context, arg GetCaptureBodiesPara
 const insertCapture = `-- name: InsertCapture :exec
 
 INSERT INTO captures (
-    session_id,
+    capture_id,
     request_id,
     client_key_id,
     model,
@@ -138,7 +126,7 @@ INSERT INTO captures (
 `
 
 type InsertCaptureParams struct {
-	SessionID      string
+	CaptureID      []byte
 	RequestID      string
 	ClientKeyID    string
 	Model          string
@@ -153,6 +141,12 @@ type InsertCaptureParams struct {
 // Queries shared by both engines for the captures summary, the capture_bodies
 // payload table and the client_keys table.
 //
+// capture_id is the primary key of a capture and the only join key: the summary
+// and the bodies of one call always live in the same database (the shard its
+// capture_id maps to) and are written in one transaction. The host request ID is
+// stored verbatim in request_id, a support-only column with neither a uniqueness
+// constraint nor an index, so it is never an identity and never a join key.
+//
 // Filters are optional: a NULL bind parameter means "not filtered" (sqlc.narg
 // renders it as sql.NullString / sql.NullInt64). An empty but valid client_key_id
 // means "the rows without a known key", which is how the unknown-key option is
@@ -160,11 +154,11 @@ type InsertCaptureParams struct {
 // concatenated into SQL.
 //
 // started_at_us is the range key: from is inclusive, to is exclusive.
-// Ordering is started_at_us DESC, session_id DESC, request_id DESC: it is total
-// because (session_id, request_id) is the primary key.
+// Ordering is started_at_us DESC, capture_id DESC: it is total because capture_id
+// is the primary key, so the sharded merge is deterministic.
 func (q *Queries) InsertCapture(ctx context.Context, arg InsertCaptureParams) error {
 	_, err := q.db.ExecContext(ctx, insertCapture,
-		arg.SessionID,
+		arg.CaptureID,
 		arg.RequestID,
 		arg.ClientKeyID,
 		arg.Model,
@@ -180,8 +174,7 @@ func (q *Queries) InsertCapture(ctx context.Context, arg InsertCaptureParams) er
 
 const insertCaptureBodies = `-- name: InsertCaptureBodies :exec
 INSERT INTO capture_bodies (
-    session_id,
-    request_id,
+    capture_id,
     request_body,
     response_body,
     websocket_body
@@ -189,14 +182,12 @@ INSERT INTO capture_bodies (
     $1,
     $2,
     $3,
-    $4,
-    $5
+    $4
 )
 `
 
 type InsertCaptureBodiesParams struct {
-	SessionID     string
-	RequestID     string
+	CaptureID     []byte
 	RequestBody   []byte
 	ResponseBody  []byte
 	WebsocketBody []byte
@@ -204,8 +195,7 @@ type InsertCaptureBodiesParams struct {
 
 func (q *Queries) InsertCaptureBodies(ctx context.Context, arg InsertCaptureBodiesParams) error {
 	_, err := q.db.ExecContext(ctx, insertCaptureBodies,
-		arg.SessionID,
-		arg.RequestID,
+		arg.CaptureID,
 		arg.RequestBody,
 		arg.ResponseBody,
 		arg.WebsocketBody,
@@ -288,7 +278,7 @@ func (q *Queries) ListCaptureModels(ctx context.Context) ([]string, error) {
 
 const listCaptures = `-- name: ListCaptures :many
 SELECT
-    c.session_id,
+    c.capture_id,
     c.request_id,
     COALESCE(k.client_key, '') AS client_key,
     c.client_key_id,
@@ -309,7 +299,7 @@ WHERE (CAST($1 AS BIGINT) IS NULL OR c.started_at_us >= $1)
       OR c.model = $4
       OR c.requested_model = $4
   )
-ORDER BY c.started_at_us DESC, c.session_id DESC, c.request_id DESC
+ORDER BY c.started_at_us DESC, c.capture_id DESC
 LIMIT $6 OFFSET $5
 `
 
@@ -319,11 +309,11 @@ type ListCapturesParams struct {
 	KeyID       sql.NullString
 	FilterModel sql.NullString
 	PageOffset  int32
-	PageSize    int32
+	PageLimit   int32
 }
 
 type ListCapturesRow struct {
-	SessionID      string
+	CaptureID      []byte
 	RequestID      string
 	ClientKey      string
 	ClientKeyID    string
@@ -336,6 +326,9 @@ type ListCapturesRow struct {
 	EventCount     int64
 }
 
+// One shard is scanned at most page_offset + page_limit rows deep: the global
+// (offset, limit) window is a subset of the union of the per-shard windows, so
+// the caller merges the shard results and slices the window out of the merge.
 // The list joins client_keys so the caller scope can be labelled without exposing
 // the plaintext through any JSON representation (Capture.ClientKey is json:"-").
 func (q *Queries) ListCaptures(ctx context.Context, arg ListCapturesParams) ([]ListCapturesRow, error) {
@@ -345,7 +338,7 @@ func (q *Queries) ListCaptures(ctx context.Context, arg ListCapturesParams) ([]L
 		arg.KeyID,
 		arg.FilterModel,
 		arg.PageOffset,
-		arg.PageSize,
+		arg.PageLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -355,7 +348,7 @@ func (q *Queries) ListCaptures(ctx context.Context, arg ListCapturesParams) ([]L
 	for rows.Next() {
 		var i ListCapturesRow
 		if err := rows.Scan(
-			&i.SessionID,
+			&i.CaptureID,
 			&i.RequestID,
 			&i.ClientKey,
 			&i.ClientKeyID,

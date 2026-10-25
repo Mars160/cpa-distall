@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -17,8 +18,37 @@ const UnknownKeyID = "unknown"
 // MaxPageSize is the largest PageSize SearchRecords accepts.
 const MaxPageSize = 100
 
+// maxMergePrefetch bounds the capacity reserved for the merged shard scan. The
+// merge itself grows as needed; the hint only avoids a large up-front allocation
+// when a deep page is requested.
+const maxMergePrefetch = 1024
+
+// MaxSearchWindow is the largest offset+limit SearchRecords accepts from a sharded
+// store. A sharded store has no global index, so a page cannot be answered with a
+// pushed-down offset: every shard must be scanned from its own top and the page is
+// sliced out of the merge, which means one page materialises up to
+// shards*(offset+limit) summaries. This constant bounds that window, so the worst
+// case stays bounded (writer_count is at most MaxWriterCount) instead of growing
+// with the offset until the process runs out of memory.
+//
+// A store that keeps one database (writer_count = 1, or PostgreSQL) is not
+// affected: its page is answered by one OFFSET/LIMIT query, so deep pages cost no
+// extra memory and stay available. The panel disables paging past the window and
+// says so; deep browsing is meant to go through narrower filters or a capture ID.
+const MaxSearchWindow = 10000
+
 // Capture is the stored summary of one client call. It is the list row of the
 // record browser and the header of the record detail view.
+//
+// CaptureID is the identity of the call: 32 lowercase hex characters describing
+// the 128 bits the plugin drew from crypto/rand at the first hook. It is also the
+// key that locates the record: the shard is derived from it and the detail view is
+// fetched by it alone.
+//
+// RequestID is the host request ID exactly as the host reported it, kept verbatim
+// for support and log correlation. It is deliberately not an identity: it carries
+// no uniqueness constraint, is not indexed, and must never be used to look a record
+// up (a host may reuse or omit it).
 //
 // ClientKey holds the client API key plaintext, which is authorised by the operator
 // so a call can be attributed to a key; the field is tagged json:"-" and is
@@ -36,7 +66,7 @@ const MaxPageSize = 100
 // are stored as epoch microseconds; the record list is filtered and ordered by
 // StartedAt.
 type Capture struct {
-	SessionID      string    `json:"session_id"`
+	CaptureID      string    `json:"capture_id"`
 	RequestID      string    `json:"request_id"`
 	ClientKey      string    `json:"-"`
 	ClientKeyID    string    `json:"client_key_id"`
@@ -135,20 +165,39 @@ func (q recordQuery) modelParam() sql.NullString {
 	return sql.NullString{String: q.Model, Valid: q.HasModel}
 }
 
+// window is the per-shard scan window that covers the global page. An item at
+// global position offset+k has at most offset+k items before it anywhere, hence at
+// most that many inside its own shard, so reading offset+limit rows from every
+// shard is enough to merge the requested page correctly. The scan itself starts at
+// the top of each shard, because the shard-local rank of a global item is unknown.
+// SearchRecords refuses a window deeper than MaxSearchWindow for that reason.
+func (q recordQuery) window() recordQuery {
+	limit := q.Offset + q.Limit
+	q.Offset = 0
+	q.Limit = limit
+	return q
+}
+
 // AppendCapture stores one summary together with the raw bodies of that call in a
-// single transaction: either the summary and the bodies are persisted or nothing
-// is, so a failed append never leaves a partial record. A duplicate
-// (session_id, request_id) fails loudly instead of overwriting the stored summary.
+// single transaction of the shard the capture ID maps to: either the summary and
+// the bodies are persisted or nothing is, so a failed append never leaves a
+// partial record. A duplicate capture ID fails loudly instead of overwriting the
+// stored summary.
 //
 // When the capture carries both a caller scope and the client key plaintext, the
-// key is upserted in the same transaction (see UpsertClientKey): a failed append
-// must not leave a half-written key behind. The summary itself never stores the
-// plaintext.
+// key is upserted in the same transaction of that shard (see UpsertClientKey).
+// Because the key is a cross-shard mapping - a later capture of the same scope can
+// land in any other shard - it is then replicated to every remaining shard. Every
+// one of them is attempted even when an earlier one fails, so one broken shard can
+// never make the plugin skip the others; the failures are joined and returned as an
+// error wrapping ErrKeyIncomplete, because the capture itself is stored. The key is
+// therefore eligible for retry on a later usage or capture, and the summary never
+// stores the plaintext.
 func (s *Store) AppendCapture(ctx context.Context, c Capture, b CaptureBodies) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db, rows, err := s.active()
+	shards, err := s.active()
 	if err != nil {
 		return err
 	}
@@ -156,33 +205,64 @@ func (s *Store) AppendCapture(ctx context.Context, c Capture, b CaptureBodies) e
 		return fmt.Errorf("storage: append capture: %w", err)
 	}
 	c.ClientKeyID = normalizeKeyID(c.ClientKeyID)
+	id, err := ParseCaptureID(c.CaptureID)
+	if err != nil {
+		return fmt.Errorf("storage: append capture: %w", err)
+	}
 	// SQLite and PostgreSQL store the bodies as NOT NULL columns, so a nil slice
 	// must be written as an empty (non-NULL) blob.
 	b.RequestBody = nonNilBytes(b.RequestBody)
 	b.ResponseBody = nonNilBytes(b.ResponseBody)
 	b.WebSocketBody = nonNilBytes(b.WebSocketBody)
 
-	tx, err := db.BeginTx(ctx, nil)
+	target := shards[shardIndex(id, len(shards))]
+	if err := appendCaptureToShard(ctx, target, id, c, b); err != nil {
+		return err
+	}
+
+	if c.ClientKey == "" || c.ClientKeyID == "" {
+		return nil
+	}
+	var keyErrs []error
+	for _, other := range shards {
+		if other.index == target.index {
+			continue
+		}
+		if err := other.rows.upsertClientKey(ctx, c.ClientKeyID, c.ClientKey); err != nil {
+			keyErrs = append(keyErrs, fmt.Errorf("shard %d: %w", other.index, err))
+		}
+	}
+	if len(keyErrs) > 0 {
+		return fmt.Errorf("%w: capture %s is stored, the key of scope %s did not reach every shard: %w",
+			ErrKeyIncomplete, c.CaptureID, shortKeyID(c.ClientKeyID), errors.Join(keyErrs...))
+	}
+	return nil
+}
+
+// appendCaptureToShard writes the summary, the bodies and the newly learned client
+// key of one capture into one shard, in one transaction.
+func appendCaptureToShard(ctx context.Context, sh *shard, id []byte, c Capture, b CaptureBodies) error {
+	tx, err := sh.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("storage: begin capture %s: %w", c.ref(), err)
+		return fmt.Errorf("storage: begin capture %s (shard %d): %w", c.CaptureID, sh.index, err)
 	}
 	// Rollback after a successful Commit is a no-op that returns ErrTxDone.
 	defer func() { _ = tx.Rollback() }()
 
-	txRows := rows.withTx(tx)
-	if err := txRows.insertCapture(ctx, c); err != nil {
-		return fmt.Errorf("storage: append capture %s: %w", c.ref(), err)
+	txRows := sh.rows.withTx(tx)
+	if err := txRows.insertCapture(ctx, id, c); err != nil {
+		return fmt.Errorf("storage: append capture %s (shard %d): %w", c.CaptureID, sh.index, err)
 	}
-	if err := txRows.insertCaptureBodies(ctx, c.SessionID, c.RequestID, b); err != nil {
-		return fmt.Errorf("storage: append bodies of capture %s: %w", c.ref(), err)
+	if err := txRows.insertCaptureBodies(ctx, id, b); err != nil {
+		return fmt.Errorf("storage: append bodies of capture %s (shard %d): %w", c.CaptureID, sh.index, err)
 	}
 	if c.ClientKeyID != "" && strings.TrimSpace(c.ClientKey) != "" {
 		if err := txRows.upsertClientKey(ctx, c.ClientKeyID, c.ClientKey); err != nil {
-			return fmt.Errorf("storage: append capture %s: upsert client key of scope %s: %w", c.ref(), shortKeyID(c.ClientKeyID), err)
+			return fmt.Errorf("storage: append capture %s (shard %d): upsert client key of scope %s: %w", c.CaptureID, sh.index, shortKeyID(c.ClientKeyID), err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("storage: commit capture %s: %w", c.ref(), err)
+		return fmt.Errorf("storage: commit capture %s (shard %d): %w", c.CaptureID, sh.index, err)
 	}
 	return nil
 }
@@ -190,6 +270,12 @@ func (s *Store) AppendCapture(ctx context.Context, c Capture, b CaptureBodies) e
 // UpsertClientKey stores the client key plaintext of one caller scope. Upstream
 // request metadata only carries the caller scope, so the plaintext arrives
 // separately; this is the only writer of the client_keys table.
+//
+// The key is a cross-shard mapping: the captures of one scope are spread over every
+// shard by capture ID, so the plaintext is written to every shard of the store. A
+// shard that fails is reported (the write is idempotent, so the caller can simply
+// retry) and never silently skipped, otherwise a shard would keep serving records
+// whose scope has no plaintext.
 //
 // The row is inserted on first sight and updated only when the stored plaintext
 // differs, so a repeated upsert is a no-op. No summary is ever read or written
@@ -202,7 +288,7 @@ func (s *Store) UpsertClientKey(ctx context.Context, keyID, clientKey string) er
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, rows, err := s.active()
+	shards, err := s.active()
 	if err != nil {
 		return err
 	}
@@ -213,20 +299,58 @@ func (s *Store) UpsertClientKey(ctx context.Context, keyID, clientKey string) er
 	if strings.TrimSpace(clientKey) == "" {
 		return errors.New("storage: upsert client key: the client key is required")
 	}
-	if err := rows.upsertClientKey(ctx, keyID, clientKey); err != nil {
-		return fmt.Errorf("storage: upsert client key of scope %s: %w", shortKeyID(keyID), err)
+	var errs []error
+	for _, sh := range shards {
+		if err := sh.rows.upsertClientKey(ctx, keyID, clientKey); err != nil {
+			errs = append(errs, fmt.Errorf("shard %d: %w", sh.index, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("storage: upsert client key of scope %s: %w", shortKeyID(keyID), errors.Join(errs...))
 	}
 	return nil
 }
 
+// GetRecord returns one summary by capture ID, without its bodies. It reports
+// ErrNotFound when no summary has that ID. The returned Capture carries no
+// plaintext client key.
+func (s *Store) GetRecord(ctx context.Context, captureID string) (Capture, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sh, id, err := s.locate(ctx, captureID)
+	if err != nil {
+		return Capture{}, err
+	}
+	record, err := sh.rows.getCapture(ctx, id)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return Capture{}, fmt.Errorf("%w: capture %s", ErrNotFound, captureID)
+	case err != nil:
+		return Capture{}, fmt.Errorf("storage: get capture %s (shard %d): %w", captureID, sh.index, err)
+	}
+	return record, nil
+}
+
 // SearchRecords returns one page of summaries, newest first, plus the total number
-// of matching records. Ordering is started_at DESC, session_id DESC,
-// request_id DESC, which is total because (session_id, request_id) is unique.
+// of matching records. Ordering is started_at DESC, capture_id DESC, which is total
+// because capture_id is unique, so the merged page is deterministic even though the
+// records come from several shards.
+//
+// A store with a single database answers the page with one OFFSET/LIMIT query: the
+// offset is pushed down into the database, so a deep page costs no extra memory. A
+// sharded store cannot do that - there is no global index and a shard-local rank
+// says nothing about the global rank - so it reads at most offset+limit rows from
+// every shard, merges them and slices the requested window out of the merge;
+// correctness does not depend on any shard holding a contiguous part of the global
+// order. That scan materialises up to shards*(offset+limit) summaries, so a window
+// deeper than MaxSearchWindow is refused with ErrSearchWindowTooDeep instead of
+// being served at an unbounded cost.
 func (s *Store) SearchRecords(ctx context.Context, filter RecordFilter) (RecordPage, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, rows, err := s.active()
+	shards, err := s.active()
 	if err != nil {
 		return RecordPage{}, err
 	}
@@ -234,13 +358,53 @@ func (s *Store) SearchRecords(ctx context.Context, filter RecordFilter) (RecordP
 	if err != nil {
 		return RecordPage{}, err
 	}
-	total, err := rows.countRecords(ctx, q)
-	if err != nil {
-		return RecordPage{}, fmt.Errorf("storage: count records: %w", err)
+	if len(shards) == 1 {
+		return searchOneShard(ctx, shards[0], q, filter)
 	}
-	items, err := rows.listRecords(ctx, q)
+	if window := q.Offset + q.Limit; window > MaxSearchWindow {
+		return RecordPage{}, fmt.Errorf("%w: offset+limit is %d, the limit for a sharded store is %d: narrow the filters or open the record by capture ID",
+			ErrSearchWindowTooDeep, window, MaxSearchWindow)
+	}
+	scan := q.window()
+
+	prefetch := scan.Limit
+	if prefetch > maxMergePrefetch {
+		prefetch = maxMergePrefetch
+	}
+	merged := make([]Capture, 0, int(prefetch)*len(shards))
+	var total int64
+	for _, sh := range shards {
+		count, err := sh.rows.countRecords(ctx, q)
+		if err != nil {
+			return RecordPage{}, fmt.Errorf("storage: count records (shard %d): %w", sh.index, err)
+		}
+		total += count
+		items, err := sh.rows.listRecords(ctx, scan)
+		if err != nil {
+			return RecordPage{}, fmt.Errorf("storage: list records (shard %d): %w", sh.index, err)
+		}
+		merged = append(merged, items...)
+	}
+	sortRecords(merged)
+
+	items := make([]Capture, 0, int(q.Limit))
+	for i := q.Offset; i < int64(len(merged)) && int64(len(items)) < q.Limit; i++ {
+		items = append(items, merged[i])
+	}
+	return RecordPage{Items: items, Total: total, Page: filter.Page, PageSize: filter.PageSize}, nil
+}
+
+// searchOneShard answers a page from the only database of the store, with the
+// driver's own OFFSET/LIMIT. Nothing is merged, so no window is materialised and no
+// depth limit applies: the offset is handled by the database.
+func searchOneShard(ctx context.Context, sh *shard, q recordQuery, filter RecordFilter) (RecordPage, error) {
+	total, err := sh.rows.countRecords(ctx, q)
 	if err != nil {
-		return RecordPage{}, fmt.Errorf("storage: list records: %w", err)
+		return RecordPage{}, fmt.Errorf("storage: count records (shard %d): %w", sh.index, err)
+	}
+	items, err := sh.rows.listRecords(ctx, q)
+	if err != nil {
+		return RecordPage{}, fmt.Errorf("storage: list records (shard %d): %w", sh.index, err)
 	}
 	if items == nil {
 		items = []Capture{}
@@ -248,54 +412,76 @@ func (s *Store) SearchRecords(ctx context.Context, filter RecordFilter) (RecordP
 	return RecordPage{Items: items, Total: total, Page: filter.Page, PageSize: filter.PageSize}, nil
 }
 
+// sortRecords orders records exactly like the per-shard SQL order:
+// started_at_us DESC, capture_id DESC. Comparing the canonical lowercase hex text
+// of a capture ID is equivalent to comparing the stored 16-byte value bytewise,
+// because every ID has the same length.
+func sortRecords(items []Capture) {
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].StartedAt.Equal(items[j].StartedAt) {
+			return items[i].StartedAt.After(items[j].StartedAt)
+		}
+		return items[i].CaptureID > items[j].CaptureID
+	})
+}
+
 // RecordOptions returns the client keys and models that occur in stored
 // summaries, for populating the record filter. Key labels are masked; the stored
 // plaintext key never leaves this package. A scope with no stored plaintext is
-// labelled as unresolved, not as the unknown key.
+// labelled as unresolved, not as the unknown key. Both lists are merged over every
+// shard and deduplicated, so a scope or model that only occurs in one shard is
+// still selectable.
 func (s *Store) RecordOptions(ctx context.Context) (RecordOptions, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, rows, err := s.active()
+	shards, err := s.active()
 	if err != nil {
 		return RecordOptions{}, err
 	}
-	keys, err := rows.listRecordKeys(ctx)
-	if err != nil {
-		return RecordOptions{}, fmt.Errorf("storage: list record keys: %w", err)
-	}
-	models, err := rows.listRecordModels(ctx)
-	if err != nil {
-		return RecordOptions{}, fmt.Errorf("storage: list record models: %w", err)
-	}
 
-	// Rows arrive ordered by client_key_id; keep the first non-empty plaintext key
-	// per scope only to build the masked label. A scope whose rows all have an empty
-	// client_key is unresolved: it is real, so it must not be reported as unknown.
-	order := make([]string, 0, len(keys))
-	samples := make(map[string]string, len(keys))
+	// The rows of one shard arrive ordered by client_key_id; the merge keeps the
+	// first non-empty plaintext per scope and re-sorts the union, so the result does
+	// not depend on the shard order.
+	samples := make(map[string]string)
 	unknown := false
-	for _, k := range keys {
-		if k.ID == "" {
-			unknown = true
-			continue
+	modelSet := make(map[string]struct{})
+	for _, sh := range shards {
+		keys, err := sh.rows.listRecordKeys(ctx)
+		if err != nil {
+			return RecordOptions{}, fmt.Errorf("storage: list record keys (shard %d): %w", sh.index, err)
 		}
-		sample, seen := samples[k.ID]
-		if !seen {
-			order = append(order, k.ID)
-			samples[k.ID] = k.Key
-			continue
+		for _, k := range keys {
+			if k.ID == "" {
+				unknown = true
+				continue
+			}
+			if sample, seen := samples[k.ID]; !seen || sample == "" {
+				samples[k.ID] = k.Key
+			}
 		}
-		if sample == "" {
-			samples[k.ID] = k.Key
+		models, err := sh.rows.listRecordModels(ctx)
+		if err != nil {
+			return RecordOptions{}, fmt.Errorf("storage: list record models (shard %d): %w", sh.index, err)
+		}
+		for _, m := range models {
+			modelSet[m] = struct{}{}
 		}
 	}
 
-	options := RecordOptions{Keys: make([]KeyOption, 0, len(order)+1), Models: models}
-	if options.Models == nil {
-		options.Models = []string{}
+	ids := make([]string, 0, len(samples))
+	for id := range samples {
+		ids = append(ids, id)
 	}
-	for _, id := range order {
+	sort.Strings(ids)
+	models := make([]string, 0, len(modelSet))
+	for m := range modelSet {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+
+	options := RecordOptions{Keys: make([]KeyOption, 0, len(ids)+1), Models: models}
+	for _, id := range ids {
 		options.Keys = append(options.Keys, KeyOption{ID: id, Label: keyLabel(id, samples[id])})
 	}
 	if unknown {
@@ -305,32 +491,42 @@ func (s *Store) RecordOptions(ctx context.Context) (RecordOptions, error) {
 }
 
 // RecordDetail returns one summary and the raw bodies stored for it. It reports
-// ErrNotFound when no summary matches the pair. The returned Capture carries no
+// ErrNotFound when no summary has that capture ID. The returned Capture carries no
 // plaintext client key.
-func (s *Store) RecordDetail(ctx context.Context, sessionID, requestID string) (RecordDetail, error) {
+func (s *Store) RecordDetail(ctx context.Context, captureID string) (RecordDetail, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, rows, err := s.active()
+	sh, id, err := s.locate(ctx, captureID)
 	if err != nil {
 		return RecordDetail{}, err
 	}
-	sessionID, requestID = strings.TrimSpace(sessionID), strings.TrimSpace(requestID)
-	if sessionID == "" {
-		return RecordDetail{}, errors.New("storage: record session ID is required")
-	}
-	record, err := rows.getCapture(ctx, sessionID, requestID)
+	record, err := sh.rows.getCapture(ctx, id)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return RecordDetail{}, fmt.Errorf("%w: capture %s/%s", ErrNotFound, sessionID, requestID)
+		return RecordDetail{}, fmt.Errorf("%w: capture %s", ErrNotFound, captureID)
 	case err != nil:
-		return RecordDetail{}, fmt.Errorf("storage: get capture %s/%s: %w", sessionID, requestID, err)
+		return RecordDetail{}, fmt.Errorf("storage: get capture %s (shard %d): %w", captureID, sh.index, err)
 	}
-	bodies, err := rows.getCaptureBodies(ctx, sessionID, requestID)
+	bodies, err := sh.rows.getCaptureBodies(ctx, id)
 	if err != nil {
-		return RecordDetail{}, fmt.Errorf("storage: get bodies of capture %s/%s: %w", sessionID, requestID, err)
+		return RecordDetail{}, fmt.Errorf("storage: get bodies of capture %s (shard %d): %w", captureID, sh.index, err)
 	}
 	return RecordDetail{Record: record, Bodies: bodies}, nil
+}
+
+// locate resolves a capture ID to the shard that holds it, so a detail request is a
+// primary-key lookup instead of a scan over every shard.
+func (s *Store) locate(ctx context.Context, captureID string) (*shard, []byte, error) {
+	shards, err := s.active()
+	if err != nil {
+		return nil, nil, err
+	}
+	id, err := ParseCaptureID(captureID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("storage: record: %w", err)
+	}
+	return shards[shardIndex(id, len(shards))], id, nil
 }
 
 // query validates the filter and converts it into bind parameters.
@@ -344,9 +540,11 @@ func (f RecordFilter) query() (recordQuery, error) {
 	if !f.From.IsZero() && !f.To.IsZero() && !f.From.Before(f.To) {
 		return recordQuery{}, errors.New("storage: record filter From must be before To (From is inclusive, To is exclusive)")
 	}
-	// PostgreSQL's generated LIMIT/OFFSET parameters are int32. Reject overflow
-	// consistently on both engines instead of wrapping a very large page number.
-	if int64(f.Page-1) > (1<<31-1)/int64(f.PageSize) {
+	// PostgreSQL's generated LIMIT/OFFSET parameters are int32, and the merged scan
+	// window of a page is offset+limit. Reject an oversized window consistently on
+	// both engines instead of wrapping it.
+	offset := (int64(f.Page) - 1) * int64(f.PageSize)
+	if offset > (1<<31-1)-int64(f.PageSize) {
 		return recordQuery{}, errors.New("storage: record page offset is too large")
 	}
 	q := recordQuery{
@@ -357,7 +555,7 @@ func (f RecordFilter) query() (recordQuery, error) {
 		KeyID:   strings.TrimSpace(f.KeyID),
 		Model:   strings.TrimSpace(f.Model),
 		Limit:   int64(f.PageSize),
-		Offset:  (int64(f.Page) - 1) * int64(f.PageSize),
+		Offset:  offset,
 	}
 	switch q.KeyID {
 	case "":
@@ -384,12 +582,12 @@ func normalizeKeyID(id string) string {
 }
 
 // validate rejects captures that cannot describe a call. Optional host fields
-// (model, requested model, source format) may be empty. The messages never contain
-// the client key.
+// (model, requested model, source format, request ID) may be empty. The
+// messages never contain the client key.
 func (c Capture) validate() error {
 	switch {
-	case strings.TrimSpace(c.SessionID) == "":
-		return errors.New("SessionID is required")
+	case strings.TrimSpace(c.CaptureID) == "":
+		return errors.New("CaptureID is required")
 	case c.StartedAt.IsZero():
 		return errors.New("StartedAt is required")
 	case c.CompletedAt.IsZero():
@@ -399,12 +597,10 @@ func (c Capture) validate() error {
 	case c.EventCount < 0:
 		return errors.New("EventCount must not be negative")
 	}
+	if _, err := ParseCaptureID(c.CaptureID); err != nil {
+		return err
+	}
 	return nil
-}
-
-// ref identifies a capture in error messages. It never includes the client key.
-func (c Capture) ref() string {
-	return fmt.Sprintf("%q/%q", c.SessionID, c.RequestID)
 }
 
 // keyLabel builds the filter label of one scope. A scope whose plaintext was never
@@ -463,9 +659,9 @@ func maskClientKey(key string) string {
 // captureFromRow builds a Capture from a summary row. clientKey is only non-empty
 // for list rows, which join the client_keys table; it is deliberately not part of
 // any JSON representation, and the detail view never selects it.
-func captureFromRow(sessionID, requestID, clientKey, clientKeyID, model, requestedModel, sourceFormat string, stream bool, startedAtUS, completedAtUS, eventCount int64) Capture {
+func captureFromRow(captureID []byte, requestID, clientKey, clientKeyID, model, requestedModel, sourceFormat string, stream bool, startedAtUS, completedAtUS, eventCount int64) Capture {
 	return Capture{
-		SessionID:      sessionID,
+		CaptureID:      formatCaptureID(captureID),
 		RequestID:      requestID,
 		ClientKey:      clientKey,
 		ClientKeyID:    clientKeyID,

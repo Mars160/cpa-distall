@@ -21,7 +21,9 @@ func TestPostgresIntegration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store, err := Open(ctx, Config{Driver: DriverPostgres, DSN: dsn})
+	// The PostgreSQL driver is not sharded: writer_count sizes the pool, so two
+	// writers can really run in parallel on one database.
+	store, err := Open(ctx, Config{Driver: DriverPostgres, DSN: dsn, WriterCount: 2})
 	if err != nil {
 		t.Fatalf("Open(postgres): %v", err)
 	}
@@ -30,20 +32,27 @@ func TestPostgresIntegration(t *testing.T) {
 	if got := store.Driver(); got != DriverPostgres {
 		t.Fatalf("Driver() = %q, want %q", got, DriverPostgres)
 	}
+	if got := store.WriterCount(); got != 2 {
+		t.Fatalf("WriterCount() = %d, want 2", got)
+	}
+	if got := store.ShardCount(); got != 1 {
+		t.Fatalf("ShardCount() = %d, want 1 (postgres keeps one database)", got)
+	}
 
-	sessionID := fmt.Sprintf("cpa-distill-test-%d", time.Now().UnixNano())
-	keyID := sessionID + "-key-id"
+	captureID := testCaptureID(fmt.Sprintf("postgres-%d", time.Now().UnixNano()))
+	idBytes := mustCaptureIDBytes(t, captureID)
+	keyID := "cpa-distill-test-key-" + captureID
 	t.Cleanup(func() {
 		cleanup := []struct {
 			query string
 			args  []any
 		}{
-			{"DELETE FROM capture_bodies WHERE session_id = $1", []any{sessionID}},
-			{"DELETE FROM captures WHERE session_id = $1", []any{sessionID}},
+			{"DELETE FROM capture_bodies WHERE capture_id = $1", []any{idBytes}},
+			{"DELETE FROM captures WHERE capture_id = $1", []any{idBytes}},
 			{"DELETE FROM client_keys WHERE key_id = $1", []any{keyID}},
 		}
 		for _, c := range cleanup {
-			if _, err := store.db.ExecContext(context.Background(), c.query, c.args...); err != nil {
+			if _, err := store.shards[0].db.ExecContext(context.Background(), c.query, c.args...); err != nil {
 				t.Errorf("cleanup %s: %v", c.query, err)
 			}
 		}
@@ -55,8 +64,8 @@ func TestPostgresIntegration(t *testing.T) {
 	const clientKey = "sk-postgres-integration-key"
 
 	capture := Capture{
-		SessionID:      sessionID,
-		RequestID:      sessionID + "-req-1",
+		CaptureID:      captureID,
+		RequestID:      requestIDForTest("postgres-request"),
 		ClientKey:      clientKey,
 		ClientKeyID:    keyID,
 		Model:          "gpt-5",
@@ -75,7 +84,7 @@ func TestPostgresIntegration(t *testing.T) {
 		t.Fatalf("AppendCapture: %v", err)
 	}
 	if err := store.AppendCapture(ctx, capture, CaptureBodies{}); err == nil {
-		t.Fatal("AppendCapture with a duplicate (session_id, request_id) succeeded, want unique violation")
+		t.Fatal("AppendCapture with a duplicate capture ID succeeded, want unique violation")
 	}
 
 	// The list, the filter options and the detail view all read the same record.
@@ -87,8 +96,11 @@ func TestPostgresIntegration(t *testing.T) {
 		t.Fatalf("SearchRecords matched %d records (%d items), want 1", page.Total, len(page.Items))
 	}
 	got := page.Items[0]
-	if got.ClientKeyID != keyID || got.EventCount != 12 || !got.Stream || got.ClientKey != clientKey {
+	if got.CaptureID != captureID || got.ClientKeyID != keyID || got.EventCount != 12 || !got.Stream || got.ClientKey != clientKey {
 		t.Fatalf("record = %+v", got)
+	}
+	if got.RequestID != capture.RequestID {
+		t.Fatalf("request_id = %q, want %q", got.RequestID, capture.RequestID)
 	}
 
 	options, err := store.RecordOptions(ctx)
@@ -113,7 +125,7 @@ func TestPostgresIntegration(t *testing.T) {
 		t.Fatalf("RecordOptions missed the stored key (%v) or model (%v)", foundKey, foundModel)
 	}
 
-	detail, err := store.RecordDetail(ctx, sessionID, capture.RequestID)
+	detail, err := store.RecordDetail(ctx, captureID)
 	if err != nil {
 		t.Fatalf("RecordDetail: %v", err)
 	}
@@ -126,7 +138,10 @@ func TestPostgresIntegration(t *testing.T) {
 	if detail.Record.ClientKey != "" {
 		t.Fatalf("RecordDetail returned the plaintext client key: %q", detail.Record.ClientKey)
 	}
-	if _, err := store.RecordDetail(ctx, sessionID, "missing"); !errors.Is(err, ErrNotFound) {
+	if _, err := store.GetRecord(ctx, captureID); err != nil {
+		t.Fatalf("GetRecord: %v", err)
+	}
+	if _, err := store.RecordDetail(ctx, testCaptureID("postgres-missing")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("RecordDetail(missing) error = %v, want ErrNotFound", err)
 	}
 
@@ -140,7 +155,7 @@ func TestPostgresIntegration(t *testing.T) {
 	if err := store.UpsertClientKey(ctx, keyID, updatedKey); err != nil {
 		t.Fatalf("UpsertClientKey(new key): %v", err)
 	}
-	after, err := store.RecordDetail(ctx, sessionID, capture.RequestID)
+	after, err := store.RecordDetail(ctx, captureID)
 	if err != nil {
 		t.Fatalf("RecordDetail after upsert: %v", err)
 	}
@@ -171,4 +186,10 @@ func TestPostgresIntegration(t *testing.T) {
 			t.Errorf("UpsertClientKey(%s) succeeded, want validation error", bad.name)
 		}
 	}
+}
+
+// requestIDForTest is a stand-in for a host request ID. The storage layer only
+// stores it verbatim, so the test may use any stable value.
+func requestIDForTest(label string) string {
+	return fmt.Sprintf("host-request-%s", label)
 }

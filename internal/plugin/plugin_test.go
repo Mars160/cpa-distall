@@ -168,20 +168,23 @@ func (f *fakeSink) setKeyErr(err error) {
 	f.mu.Unlock()
 }
 
-// sinkSeq hands out one fresh fakeSink per Open call.
+// sinkSeq hands out one fresh fakeSink per Open call and records the storage
+// configuration of every Open, so tests can assert what the plugin asked for.
 type sinkSeq struct {
-	mu    sync.Mutex
-	sinks []*fakeSink
-	idx   int
-	fail  error
+	mu      sync.Mutex
+	sinks   []*fakeSink
+	configs []storage.Config
+	idx     int
+	fail    error
 }
 
-func (s *sinkSeq) next(context.Context, storage.Config) (Sink, error) {
+func (s *sinkSeq) next(_ context.Context, cfg storage.Config) (Sink, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
 		return nil, s.fail
 	}
+	s.configs = append(s.configs, cfg)
 	var sink *fakeSink
 	if s.idx < len(s.sinks) {
 		sink = s.sinks[s.idx]
@@ -191,6 +194,13 @@ func (s *sinkSeq) next(context.Context, storage.Config) (Sink, error) {
 	}
 	s.idx++
 	return sink, nil
+}
+
+// config returns the storage configuration of the i-th Open.
+func (s *sinkSeq) config(i int) storage.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.configs[i]
 }
 
 func (s *sinkSeq) at(i int) *fakeSink {
@@ -372,6 +382,9 @@ func TestRegisterRejectsInvalidConfigAndKeepsHooksTransparent(t *testing.T) {
 		"max_request_bytes: 0\n",
 		"max_buffer_bytes: 1\n",
 		"dsn: [\n",
+		"writer_count: 0\n",
+		"writer_count: -1\n",
+		"writer_count: 65\n",
 	} {
 		resp := p.Handle("plugin.register", lifecycleRaw(yaml))
 		var out envelope
@@ -543,11 +556,11 @@ func TestSuccessfulRequestPersistsOneCompleteCapture(t *testing.T) {
 		t.Fatalf("got %d captures, want exactly 1 atomic capture", len(captures))
 	}
 	got := captures[0]
-	if got.Capture.SessionID == "" {
-		t.Error("capture has no session ID")
+	if _, err := storage.ParseCaptureID(got.Capture.CaptureID); err != nil {
+		t.Errorf("capture has no valid capture ID: %q", got.Capture.CaptureID)
 	}
 	if got.Capture.RequestID != reqID {
-		t.Errorf("capture request id = %q, want %q", got.Capture.RequestID, reqID)
+		t.Errorf("capture request ID = %q, want %q", got.Capture.RequestID, reqID)
 	}
 	if got.Capture.Model != "upstream-model" {
 		t.Errorf("capture model = %q, want the last observed upstream model", got.Capture.Model)
@@ -902,8 +915,10 @@ func TestRequestOverflowMidTraceSkipsWholeRequest(t *testing.T) {
 // The per-request capacity boundary is exact: a capture that fits its budget byte
 // for byte is kept, one byte more is skipped whole. A raw-JSON-length estimate
 // (about a third larger than the decoded body) would drop the fitting capture.
+// The charge of a fresh capture is the capture ID (32 hex characters), the host
+// request ID (stored verbatim: one byte for "r") and the fixed overhead.
 func TestCapacityBoundaryIsExact(t *testing.T) {
-	const limit = 1257 // 1000 body bytes + 1 request id byte + 256 overhead
+	const limit = 1289 // 1000 body bytes + 32 capture ID + 1 request ID byte + 256 overhead
 	seq := &sinkSeq{}
 	p := NewWithOpener(seq.next)
 	register(t, p, configYAML(fmt.Sprintf("max_request_bytes: %d\nmax_buffer_bytes: %d\n", limit, limit)))
@@ -927,7 +942,7 @@ func TestCapacityBoundaryIsExact(t *testing.T) {
 // whenever its decoded bytes fit: the pre-decode check may not reject it on the
 // longer raw JSON length.
 func TestEscapedBodyIsNotRejectedBeforeDecoding(t *testing.T) {
-	const limit = 1257 // 1000 body bytes + 1 request id byte + 256 overhead
+	const limit = 1289 // 1000 body bytes + 32 capture ID + 1 request ID byte + 256 overhead
 	escaped := func(n int) json.RawMessage {
 		encoded := base64.StdEncoding.EncodeToString(body(n))
 		return json.RawMessage(`"` + strings.ReplaceAll(encoded, "=", `\u003d`) + `"`)
@@ -1158,21 +1173,32 @@ func TestConcurrentRequestIDsAreIsolated(t *testing.T) {
 	closePlugin(t, p)
 
 	byRequest := map[string]fakeCapture{}
+	ids := map[string]bool{}
 	for _, c := range seq.at(0).snapshot() {
 		byRequest[c.Capture.RequestID] = c
+		if _, err := storage.ParseCaptureID(c.Capture.CaptureID); err != nil {
+			t.Errorf("capture of request %q has no valid capture ID %q: %v", c.Capture.RequestID, c.Capture.CaptureID, err)
+		}
+		if ids[c.Capture.CaptureID] {
+			t.Errorf("capture ID %s was reused for two calls", c.Capture.CaptureID)
+		}
+		ids[c.Capture.CaptureID] = true
 	}
 	if len(byRequest) != workers {
 		t.Fatalf("persisted %d distinct requests, want %d", len(byRequest), workers)
 	}
-	for id, c := range byRequest {
-		if string(c.Bodies.RequestBody) != id {
-			t.Errorf("%s request body = %q, want %q", id, c.Bodies.RequestBody, id)
+	for requestID, c := range byRequest {
+		body := string(c.Bodies.RequestBody)
+		if requestID != body {
+			t.Errorf("request ID %q does not describe the body %q", requestID, body)
 		}
-		if string(c.Bodies.ResponseBody) != id {
-			t.Errorf("%s response body = %q, want %q", id, c.Bodies.ResponseBody, id)
+		// The response body of this test is the same request ID, so it proves the two
+		// captures were never mixed up.
+		if string(c.Bodies.ResponseBody) != body {
+			t.Errorf("request %q response body = %q, want %q", body, c.Bodies.ResponseBody, body)
 		}
 		if c.Capture.EventCount != 4 {
-			t.Errorf("%s event count = %d, want 4", id, c.Capture.EventCount)
+			t.Errorf("request %q event count = %d, want 4", body, c.Capture.EventCount)
 		}
 	}
 	assertSettled(t, p)
@@ -1450,4 +1476,737 @@ func TestUsageKeyIsNotLostWhenTheQueueIsFull(t *testing.T) {
 	waitFor(t, "the retried key write", func() bool { return len(sink.keysSnapshot()) == 1 })
 	waitDrained(t, p)
 	assertSettled(t, p)
+}
+
+// ---------------------------------------------------------------------------
+// stream fragments: references on the hook path, one merge in the writer
+// ---------------------------------------------------------------------------
+
+func TestStreamFragmentsAreRetainedByReferenceAndMergedInOrder(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	const reqID = "req-many-fragments"
+	const chunks = 300
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": reqID, "Stream": true, "Body": []byte("request-body")})
+	var want strings.Builder
+	for i := 0; i < chunks; i++ {
+		chunk := fmt.Sprintf("data: fragment-%03d\n\n", i)
+		want.WriteString(chunk)
+		send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": reqID, "ChunkIndex": i, "Body": []byte(chunk)})
+	}
+	// The hook path keeps one reference per fragment instead of copying every
+	// fragment into a single growing buffer under the lock.
+	p.mu.Lock()
+	refs := len(p.pending[reqID].streamChunks)
+	p.mu.Unlock()
+	if refs != chunks {
+		t.Fatalf("pending capture holds %d fragment references, want %d", refs, chunks)
+	}
+	send(t, p, "request.complete", map[string]any{"RequestID": reqID, "Outcome": "succeeded"})
+	closePlugin(t, p)
+
+	captures := seq.at(0).snapshot()
+	if len(captures) != 1 {
+		t.Fatalf("persisted %d captures, want 1", len(captures))
+	}
+	if !bytes.Equal(captures[0].Bodies.ResponseBody, []byte(want.String())) {
+		t.Fatalf("merged response = %d bytes, want %d bytes in arrival order", len(captures[0].Bodies.ResponseBody), want.Len())
+	}
+	assertSettled(t, p)
+}
+
+// Every fragment must be charged to the budget in constant time: the hook path keeps
+// a running byte total, so pendingSize never rescans the fragments already retained.
+func TestStreamChunkBytesAccumulateWithoutRescanning(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	const reqID = "req-accumulate"
+	const chunks = 1024
+	const chunkBody = "ABCDEFGH" // 8 bytes; a padded decode buffer can be one larger
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": reqID, "Stream": true, "Body": []byte("req")})
+	for i := 0; i < chunks; i++ {
+		send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": reqID, "ChunkIndex": i, "Body": []byte(chunkBody)})
+	}
+	p.mu.Lock()
+	item := p.pending[reqID]
+	gotBytes, refs, refCap := item.chunkBytes, len(item.streamChunks), cap(item.streamChunks)
+	wantBytes := 0
+	for _, c := range item.streamChunks {
+		wantBytes += cap(c)
+	}
+	size := pendingSize(item)
+	p.mu.Unlock()
+
+	if refs != chunks {
+		t.Fatalf("retained %d references, want %d", refs, chunks)
+	}
+	if gotBytes != wantBytes {
+		t.Fatalf("accumulated chunk bytes = %d, want the sum of capacities %d", gotBytes, wantBytes)
+	}
+	if gotBytes < chunks*len(chunkBody) {
+		t.Fatalf("accumulated chunk bytes = %d, want at least the %d payload bytes", gotBytes, chunks*len(chunkBody))
+	}
+	// pendingSize must be the running total plus the reference headers, never a
+	// rescan of every fragment.
+	if want := gotBytes + refCap*streamChunkRefOverhead + len("req") + storage.CaptureIDHexLen + len(reqID) + captureOverhead; size != want {
+		t.Fatalf("pendingSize = %d, want %d", size, want)
+	}
+	send(t, p, "request.complete", map[string]any{"RequestID": reqID, "Outcome": "succeeded"})
+	closePlugin(t, p)
+	if got := len(seq.at(0).snapshot()); got != 1 {
+		t.Fatalf("persisted %d captures, want 1", got)
+	}
+	assertSettled(t, p)
+}
+
+func TestEmptyStreamFragmentsAreNotRetained(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	const reqID = "req-empty-fragments"
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": reqID, "Stream": true, "Body": []byte("request-body")})
+	for i := 0; i < 5000; i++ {
+		send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": reqID, "ChunkIndex": i, "Body": nil})
+	}
+	p.mu.Lock()
+	item := p.pending[reqID]
+	refs, seen := len(item.streamChunks), item.streamSeen
+	p.mu.Unlock()
+	if refs != 0 {
+		t.Fatalf("5000 empty fragments retained %d references, want 0", refs)
+	}
+	if !seen {
+		t.Fatal("an observed stream must stay observed even when every fragment is empty")
+	}
+	send(t, p, "request.complete", map[string]any{"RequestID": reqID, "Outcome": "succeeded"})
+	closePlugin(t, p)
+	captures := seq.at(0).snapshot()
+	if len(captures) != 1 {
+		t.Fatalf("persisted %d captures, want 1", len(captures))
+	}
+	if got := captures[0].Bodies.ResponseBody; len(got) != 0 {
+		t.Fatalf("empty stream stored %d response bytes, want 0", len(got))
+	}
+	assertSettled(t, p)
+}
+
+func TestStreamFragmentLimitSkipsTheWholeCapture(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	const reqID = "req-fragment-limit"
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": reqID, "Stream": true, "Body": []byte("request-body")})
+	// Simulate a stream that already reached the explicit reference bound: the next
+	// fragment must drop the whole capture, never keep a prefix of the stream.
+	p.mu.Lock()
+	item := p.pending[reqID]
+	for i := 0; i < maxStreamChunkRefs; i++ {
+		chunk := []byte("x")
+		item.streamChunks = append(item.streamChunks, chunk)
+		item.chunkBytes += cap(chunk) // keep the running counter consistent with the list
+	}
+	p.mu.Unlock()
+	send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": reqID, "ChunkIndex": 0, "Body": []byte("y")})
+	send(t, p, "request.complete", map[string]any{"RequestID": reqID, "Outcome": "succeeded"})
+	closePlugin(t, p)
+	if got := len(seq.at(0).snapshot()); got != 0 {
+		t.Fatalf("a capture past the fragment bound stored %d rows, want 0", got)
+	}
+	if droppedOf(p) == 0 {
+		t.Fatal("the over-limit capture was not accounted as dropped")
+	}
+	assertSettled(t, p)
+}
+
+func TestStreamFragmentCapacityCountsAgainstTheBudget(t *testing.T) {
+	// A 1-byte fragment decodes into a 3-byte buffer and its reference costs a
+	// slice header. A budget that fits the 1-byte length but not the 3-byte
+	// capacity plus header must still skip the whole capture.
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	// 3 request bytes + 32 capture ID + 1 request ID byte + 256 overhead = 292
+	// retained; the fragment costs 3 capacity + 24 header = 27, so 318 is one byte
+	// short of keeping it.
+	const limit = 318
+	register(t, p, configYAML(fmt.Sprintf("max_request_bytes: %d\nmax_buffer_bytes: %d\n", limit, limit)))
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": "r", "Stream": true, "Body": []byte("req")})
+	send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": "r", "ChunkIndex": 0, "Body": []byte("A")})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r", "Outcome": "succeeded"})
+	closePlugin(t, p)
+	if got := len(seq.at(0).snapshot()); got != 0 {
+		t.Fatalf("a fragment whose capacity exceeds the budget stored %d captures, want 0", got)
+	}
+	if droppedOf(p) == 0 {
+		t.Fatal("the over-budget fragment was not accounted as dropped")
+	}
+	assertSettled(t, p)
+}
+
+// A stream capture whose fragments fit the retained budget can still need a
+// transient merge buffer. When the global budget has room for it the merge runs and
+// the concatenated body is stored exactly once.
+func TestMergeTransientThatFitsTheGlobalBudgetIsStored(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	// 3 request bytes + 32 capture ID + 1 request ID byte + 256 overhead + 2
+	// references (2*24) + 2 fragments of 3 bytes = 346 retained bytes; the merge
+	// needs 6 more, so 352 fits exactly.
+	const limit = 352
+	register(t, p, configYAML(fmt.Sprintf("max_request_bytes: %d\nmax_buffer_bytes: %d\n", limit, limit)))
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": "r", "Stream": true, "Body": []byte("req")})
+	send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": "r", "ChunkIndex": 0, "Body": []byte("ABC")})
+	send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": "r", "ChunkIndex": 1, "Body": []byte("DEF")})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r", "Outcome": "succeeded"})
+	closePlugin(t, p)
+
+	captures := seq.at(0).snapshot()
+	if len(captures) != 1 {
+		t.Fatalf("persisted %d captures, want 1", len(captures))
+	}
+	if got := string(captures[0].Bodies.ResponseBody); got != "ABCDEF" {
+		t.Fatalf("stored response = %q, want the fragments merged once", got)
+	}
+	if got := droppedOf(p); got != 0 {
+		t.Fatalf("drops = %d, want 0", got)
+	}
+	if got := failuresOf(p); got != 0 {
+		t.Fatalf("write failures = %d, want 0", got)
+	}
+	assertSettled(t, p)
+}
+
+// When the global budget has no room for the transient merge the whole stream
+// capture is skipped: no partial body, no write failure, and earlier successful
+// captures stay intact.
+func TestMergeTransientWithoutRoomSkipsTheWholeCapture(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	// The same capture retains exactly 351 bytes (its host request ID "stream" is
+	// longer than "r"), so the 6-byte merge does not fit and is skipped instead of
+	// blocking the writer.
+	const limit = 351
+	register(t, p, configYAML(fmt.Sprintf("max_request_bytes: %d\nmax_buffer_bytes: %d\n", limit, limit)))
+
+	// A plain capture is written first and must survive the later drop untouched.
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": "plain", "Body": []byte("req")})
+	send(t, p, "request.complete", map[string]any{"RequestID": "plain", "Outcome": "succeeded"})
+	waitFor(t, "the plain capture write", func() bool { return len(seq.at(0).snapshot()) == 1 })
+	waitDrained(t, p)
+
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": "stream", "Stream": true, "Body": []byte("req")})
+	send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": "stream", "ChunkIndex": 0, "Body": []byte("ABC")})
+	send(t, p, "response.intercept_stream_chunk", map[string]any{"RequestID": "stream", "ChunkIndex": 1, "Body": []byte("DEF")})
+	send(t, p, "request.complete", map[string]any{"RequestID": "stream", "Outcome": "succeeded"})
+	closePlugin(t, p)
+
+	captures := seq.at(0).snapshot()
+	if len(captures) != 1 {
+		t.Fatalf("persisted %d captures, want only the earlier plain one", len(captures))
+	}
+	if got := captures[0].Capture.RequestID; got != "plain" {
+		t.Fatalf("persisted request %q, want the earlier successful capture", got)
+	}
+	if got := string(captures[0].Bodies.RequestBody); got != "req" {
+		t.Fatalf("the surviving capture body changed to %q", got)
+	}
+	if droppedOf(p) == 0 {
+		t.Fatal("the capture without room for the merge was not accounted as dropped")
+	}
+	if got := failuresOf(p); got != 0 {
+		t.Fatalf("a dropped merge must not be a write failure (got %d)", got)
+	}
+	assertSettled(t, p)
+}
+
+// ---------------------------------------------------------------------------
+// client keys: a stored key is never upserted twice
+// ---------------------------------------------------------------------------
+
+func TestCaptureWithKeyStoresTheKeyAndSkipsTheUsageUpsert(t *testing.T) {
+	sink := &fakeSink{}
+	seq := &sinkSeq{sinks: []*fakeSink{sink}}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	t.Cleanup(func() { _ = p.Close() })
+
+	key := "sk-client-capture-key"
+	scope := keyID(key)
+	send(t, p, "request.intercept_before", map[string]any{
+		"RequestID": "r", "Body": []byte("req"),
+		"Metadata": map[string]any{"caller_scope": scope},
+		"Headers":  map[string][]string{"Authorization": {"Bearer " + key}},
+	})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r", "Outcome": "succeeded"})
+	waitFor(t, "the capture write", func() bool { return len(sink.snapshot()) == 1 })
+	waitDrained(t, p)
+
+	if got := sink.snapshot()[0].Capture.ClientKey; got != key {
+		t.Fatalf("capture stored key %q, want the plaintext so the key row is written in its own transaction", got)
+	}
+	if got := sink.keyCallCount(); got != 0 {
+		t.Fatalf("capture-with-key made %d separate key upserts, want 0", got)
+	}
+	// The capture already stored the key: the usage observation must not enqueue a
+	// redundant upsert.
+	send(t, p, "usage.handle", map[string]any{"APIKey": key})
+	time.Sleep(20 * time.Millisecond)
+	if got := sink.keyCallCount(); got != 0 {
+		t.Fatalf("a key stored by a capture was upserted again (%d)", got)
+	}
+	waitDrained(t, p)
+	assertSettled(t, p)
+}
+
+func TestFailedCaptureWithKeyDoesNotMarkTheKeyStored(t *testing.T) {
+	sink := &fakeSink{}
+	sink.setErr(errors.New("database is down"))
+	seq := &sinkSeq{sinks: []*fakeSink{sink}}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	t.Cleanup(func() { _ = p.Close() })
+
+	key := "sk-client-capture-failed"
+	scope := keyID(key)
+	send(t, p, "request.intercept_before", map[string]any{
+		"RequestID": "r", "Body": []byte("req"),
+		"Metadata": map[string]any{"caller_scope": scope},
+		"Headers":  map[string][]string{"Authorization": {"Bearer " + key}},
+	})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r", "Outcome": "succeeded"})
+	waitFor(t, "the failed capture write", func() bool { return sink.callCount() == 1 })
+	waitDrained(t, p)
+	if got := len(sink.snapshot()); got != 0 {
+		t.Fatalf("a failing sink stored %d captures", got)
+	}
+	// A failed capture must not mark the key: the next usage retries it.
+	send(t, p, "usage.handle", map[string]any{"APIKey": key})
+	waitFor(t, "the retried key upsert", func() bool { return sink.keyCallCount() == 1 })
+	waitDrained(t, p)
+	if got := len(sink.keysSnapshot()); got != 1 {
+		t.Fatalf("the key was not retried after the capture failed (%d keys)", got)
+	}
+	assertSettled(t, p)
+}
+
+func TestAlreadyStoredKeyIsClearedFromLaterCaptures(t *testing.T) {
+	sink := &fakeSink{}
+	seq := &sinkSeq{sinks: []*fakeSink{sink}}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	t.Cleanup(func() { _ = p.Close() })
+
+	key := "sk-client-already-stored"
+	scope := keyID(key)
+	// Store the key through the usage path first.
+	send(t, p, "usage.handle", map[string]any{"APIKey": key})
+	waitFor(t, "the key upsert", func() bool { return len(sink.keysSnapshot()) == 1 })
+	waitDrained(t, p)
+
+	// A later capture that resolves the same plaintext must not carry it: the
+	// writer clears it, so AppendCapture does not upsert the key again.
+	send(t, p, "request.intercept_before", map[string]any{
+		"RequestID": "r", "Body": []byte("req"),
+		"Metadata": map[string]any{"caller_scope": scope},
+		"Headers":  map[string][]string{"Authorization": {"Bearer " + key}},
+	})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r", "Outcome": "succeeded"})
+	waitFor(t, "the capture write", func() bool { return len(sink.snapshot()) == 1 })
+	waitDrained(t, p)
+
+	if got := sink.snapshot()[0].Capture.ClientKey; got != "" {
+		t.Fatalf("capture carried the already-stored key %q; AppendCapture would upsert it again", got)
+	}
+	if got := sink.keyCallCount(); got != 1 {
+		t.Fatalf("key upserts = %d, want exactly the initial usage upsert", got)
+	}
+	assertSettled(t, p)
+}
+
+func TestQueuedUsageIsSkippedWhenTheCaptureAlreadyStoredTheKey(t *testing.T) {
+	sink := &fakeSink{gate: make(chan struct{}), entered: make(chan struct{}, 1)}
+	seq := &sinkSeq{sinks: []*fakeSink{sink}}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML("queue_size: 8\n"))
+	t.Cleanup(func() { _ = p.Close() })
+
+	key := "sk-client-queued-usage"
+	scope := keyID(key)
+	send(t, p, "request.intercept_before", map[string]any{
+		"RequestID": "r", "Body": []byte("req"),
+		"Metadata": map[string]any{"caller_scope": scope},
+		"Headers":  map[string][]string{"Authorization": {"Bearer " + key}},
+	})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r", "Outcome": "succeeded"})
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background writer never reached the sink")
+	}
+	// The capture is parked inside AppendCapture; this usage is queued behind it.
+	send(t, p, "usage.handle", map[string]any{"APIKey": key})
+	if got := sink.keyCallCount(); got != 0 {
+		t.Fatalf("usage was written while its capture was still parked (%d)", got)
+	}
+	close(sink.gate)
+	waitDrained(t, p)
+	if got := sink.keyCallCount(); got != 0 {
+		t.Fatalf("a usage queued behind its capture still upserted the key (%d)", got)
+	}
+	if got := len(sink.snapshot()); got != 1 {
+		t.Fatalf("persisted %d captures, want 1", got)
+	}
+	assertSettled(t, p)
+}
+
+// A heavy mixed load of fragments, client keys and reconfigures must stay
+// race-free and leave no byte or pending accounting behind.
+func TestConcurrentFragmentsKeysAndReconfigureDoNotLeak(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML("max_pending_requests: 256\nqueue_size: 64\n"))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for n := 0; ; n++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := fmt.Sprintf("frag-%d-%d", worker, n)
+				key := fmt.Sprintf("sk-frag-%d-%d", worker, n%4)
+				scope := keyID(key)
+				p.Handle("request.intercept_before", mustMarshal(map[string]any{
+					"RequestID": id, "Stream": true, "Body": []byte("req"),
+					"Metadata": map[string]any{"caller_scope": scope},
+					"Headers":  map[string][]string{"Authorization": {"Bearer " + key}},
+				}))
+				for c := 0; c < 4; c++ {
+					p.Handle("response.intercept_stream_chunk", mustMarshal(map[string]any{"RequestID": id, "ChunkIndex": c, "Body": []byte(fmt.Sprintf("chunk-%d", c))}))
+				}
+				p.Handle("request.complete", mustMarshal(map[string]any{"RequestID": id, "Outcome": "succeeded"}))
+				p.Handle("usage.handle", mustMarshal(map[string]any{"APIKey": key}))
+			}
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 30; i++ {
+			p.Handle("plugin.reconfigure", lifecycleRaw(configYAML(fmt.Sprintf("queue_size: %d\n", 8+i%3))))
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	closePlugin(t, p)
+
+	for i, s := range seq.all() {
+		if got := s.closeCount(); got != 1 {
+			t.Errorf("backend %d closed %d times, want exactly 1", i, got)
+		}
+	}
+	assertSettled(t, p)
+}
+
+// ---------------------------------------------------------------------------
+// writer_count: the configuration reaches the store and really runs writers
+// ---------------------------------------------------------------------------
+
+// TestWriterCountReachesTheStore pins the wiring: the plugin passes writer_count
+// (and the default) to the store and does not invent its own value.
+func TestWriterCountReachesTheStore(t *testing.T) {
+	seq := &sinkSeq{}
+	p := NewWithOpener(seq.next)
+	register(t, p, configYAML("writer_count: 4\n"))
+	if got := seq.config(0).WriterCount; got != 4 {
+		t.Fatalf("store opened with writer_count %d, want 4", got)
+	}
+	if got := seq.config(0).Driver; got != "sqlite" {
+		t.Fatalf("store opened with driver %q, want sqlite", got)
+	}
+	if got := seq.config(0).DSN; got != "cpa-distill-data" {
+		t.Fatalf("store opened with dsn %q, want the documented default", got)
+	}
+	closePlugin(t, p)
+
+	// An unset writer_count means one writer, the documented default.
+	seq = &sinkSeq{}
+	p = NewWithOpener(seq.next)
+	register(t, p, configYAML(""))
+	if got := seq.config(0).WriterCount; got != 1 {
+		t.Fatalf("default writer_count = %d, want 1", got)
+	}
+	closePlugin(t, p)
+}
+
+// concurrencySink parks every AppendCapture until release is closed and records how
+// many calls were in flight at once, so a test can prove that several writers really
+// run in parallel and that closing the plugin still drains all of them.
+type concurrencySink struct {
+	mu       sync.Mutex
+	inflight int
+	max      int
+	written  int
+	entered  chan struct{}
+	release  chan struct{}
+}
+
+func (s *concurrencySink) AppendCapture(ctx context.Context, _ storage.Capture, _ storage.CaptureBodies) error {
+	s.mu.Lock()
+	s.inflight++
+	if s.inflight > s.max {
+		s.max = s.inflight
+	}
+	s.mu.Unlock()
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		s.mu.Lock()
+		s.inflight--
+		s.mu.Unlock()
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	s.inflight--
+	s.written++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *concurrencySink) UpsertClientKey(context.Context, string, string) error { return nil }
+func (s *concurrencySink) Close() error                                          { return nil }
+
+func (s *concurrencySink) stats() (max, written int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.max, s.written
+}
+
+// TestWriterCountRunsConcurrentWritersOnOneSharedQueue pins the two properties the
+// writer pool must have: writer_count writers really write at the same time, and
+// they share one queue, so the queue capacity is not multiplied by the writer count.
+func TestWriterCountRunsConcurrentWritersOnOneSharedQueue(t *testing.T) {
+	const queueSize = 32
+	for _, writerCount := range []int{1, 4} {
+		t.Run(fmt.Sprintf("writer_count=%d", writerCount), func(t *testing.T) {
+			sink := &concurrencySink{entered: make(chan struct{}, 64), release: make(chan struct{})}
+			var opened storage.Config
+			p := NewWithOpener(func(_ context.Context, c storage.Config) (Sink, error) {
+				opened = c
+				return sink, nil
+			})
+			register(t, p, configYAML(fmt.Sprintf("writer_count: %d\nqueue_size: %d\n", writerCount, queueSize)))
+			t.Cleanup(func() { _ = p.Close() })
+
+			if opened.WriterCount != writerCount {
+				t.Fatalf("store opened with writer_count %d, want %d", opened.WriterCount, writerCount)
+			}
+			p.mu.Lock()
+			queueCap, workers := cap(p.current.queue), writerCount
+			p.mu.Unlock()
+			if queueCap != queueSize {
+				t.Fatalf("queue capacity = %d, want the single global queue of %d", queueCap, queueSize)
+			}
+			if workers < 1 {
+				t.Fatalf("writer_count %d must run at least one writer", workers)
+			}
+
+			// Fill the queue while every writer is parked inside the sink.
+			const requests = 8
+			for i := 0; i < requests; i++ {
+				id := fmt.Sprintf("pool-%d", i)
+				send(t, p, "request.intercept_before", map[string]any{"RequestID": id, "Body": []byte("AAAA")})
+				send(t, p, "request.complete", map[string]any{"RequestID": id, "Outcome": "succeeded"})
+			}
+			waitFor(t, "the writer pool to saturate", func() bool {
+				max, _ := sink.stats()
+				return max >= writerCount
+			})
+			close(sink.release)
+			closePlugin(t, p)
+
+			max, written := sink.stats()
+			if max != writerCount {
+				t.Fatalf("observed %d concurrent writers, want exactly %d", max, writerCount)
+			}
+			if written != requests {
+				t.Fatalf("wrote %d captures, want %d", written, requests)
+			}
+			assertSettled(t, p)
+		})
+	}
+}
+
+// TestBufferBudgetIsSharedAcrossWriters proves that max_buffer_bytes stays one
+// global budget: with room for exactly one capture of this shape, four writers still
+// admit only one and skip the second instead of granting every writer its own copy.
+func TestBufferBudgetIsSharedAcrossWriters(t *testing.T) {
+	sink := &fakeSink{gate: make(chan struct{}), entered: make(chan struct{}, 1)}
+	seq := &sinkSeq{sinks: []*fakeSink{sink}}
+	p := NewWithOpener(seq.next)
+	// A capture with a 1000-byte request body is charged 1000 + 32 + 64 + 256.
+	const limit = 1000 + storage.CaptureIDHexLen + len("r1") + captureOverhead
+	register(t, p, configYAML(fmt.Sprintf("writer_count: 4\nmax_request_bytes: %d\nmax_buffer_bytes: %d\n", limit, limit)))
+	t.Cleanup(func() { _ = p.Close() })
+
+	// r1 is accepted and parks inside one writer, still charged to the global budget.
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": "r1", "Body": body(1000)})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r1", "Outcome": "succeeded"})
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background writer never reached the sink")
+	}
+
+	// r2 fits its own per-request budget but not the remaining global budget.
+	send(t, p, "request.intercept_before", map[string]any{"RequestID": "r2", "Body": body(1000)})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r2", "Outcome": "succeeded"})
+
+	close(sink.gate)
+	closePlugin(t, p)
+
+	captures := sink.snapshot()
+	if len(captures) != 1 {
+		t.Fatalf("persisted %d captures, want 1: the buffer budget must stay global", len(captures))
+	}
+	if got := captures[0].Capture.RequestID; got != "r1" {
+		t.Fatalf("persisted request %q, want r1", got)
+	}
+	if droppedOf(p) == 0 {
+		t.Fatal("the request over the shared budget was not accounted as dropped")
+	}
+	assertSettled(t, p)
+}
+
+// incompleteKeySink behaves like a sharded store whose client-key replication to
+// another shard failed: the capture row is stored, but AppendCapture reports an
+// error wrapping storage.ErrKeyIncomplete.
+type incompleteKeySink struct {
+	mu       sync.Mutex
+	captures []fakeCapture
+	keyCalls int
+	keyErr   error
+	appended int
+}
+
+func (s *incompleteKeySink) AppendCapture(_ context.Context, c storage.Capture, b storage.CaptureBodies) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appended++
+	s.captures = append(s.captures, fakeCapture{Capture: c, Bodies: b})
+	if c.ClientKey != "" && s.keyErr != nil {
+		return fmt.Errorf("%w: shard 1: %v", storage.ErrKeyIncomplete, s.keyErr)
+	}
+	return nil
+}
+
+func (s *incompleteKeySink) UpsertClientKey(_ context.Context, _, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keyCalls++
+	return s.keyErr
+}
+
+func (s *incompleteKeySink) Close() error { return nil }
+
+func (s *incompleteKeySink) setKeyErr(err error) {
+	s.mu.Lock()
+	s.keyErr = err
+	s.mu.Unlock()
+}
+
+func (s *incompleteKeySink) stats() (captures, keyCalls int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.captures), s.keyCalls
+}
+
+// TestIncompleteKeyReplicationIsNotACaptureFailure pins the split between "the
+// capture is lost" and "the key still needs a retry": a partial key replication
+// must keep the stored capture, must not raise the write-failure counter, and must
+// leave the key eligible for the next attempt.
+func TestIncompleteKeyReplicationIsNotACaptureFailure(t *testing.T) {
+	sink := &incompleteKeySink{keyErr: errors.New("shard 1 is read-only")}
+	p := NewWithOpener(func(context.Context, storage.Config) (Sink, error) { return sink, nil })
+	register(t, p, configYAML(""))
+	t.Cleanup(func() { _ = p.Close() })
+
+	key := "sk-client-incomplete"
+	scope := keyID(key)
+	send(t, p, "request.intercept_before", map[string]any{
+		"RequestID": "r", "Body": []byte("req"),
+		"Metadata": map[string]any{"caller_scope": scope},
+		"Headers":  map[string][]string{"Authorization": {"Bearer " + key}},
+	})
+	send(t, p, "request.complete", map[string]any{"RequestID": "r", "Outcome": "succeeded"})
+	waitDrained(t, p)
+
+	captures, _ := sink.stats()
+	if captures != 1 {
+		t.Fatalf("stored %d captures, want the capture to survive an incomplete key replication", captures)
+	}
+	if got := failuresOf(p); got != 0 {
+		t.Fatalf("write failures = %d, want 0: the capture was stored", got)
+	}
+	if got := p.keyFailures.Load(); got != 1 {
+		t.Fatalf("key replication failures = %d, want 1", got)
+	}
+	if droppedOf(p) != 0 {
+		t.Fatalf("drops = %d, want 0", droppedOf(p))
+	}
+
+	// The key was never marked stored, so the next usage retries it.
+	sink.setKeyErr(nil)
+	send(t, p, "usage.handle", map[string]any{"APIKey": key})
+	waitFor(t, "the retried key upsert", func() bool {
+		_, calls := sink.stats()
+		return calls == 1
+	})
+	waitDrained(t, p)
+	assertSettled(t, p)
+}
+
+// TestHostRequestIDIsStoredVerbatim guards the support path: the host request ID is
+// what operators grep their proxy logs with, so the stored value must be the host's
+// own string, byte for byte. Hashing it (or truncating it) would silently break that
+// correlation, and nothing else in the design depends on it: it is never an
+// identity, never unique and never used to look a record up.
+func TestHostRequestIDIsStoredVerbatim(t *testing.T) {
+	for _, reqID := range []string{
+		"req-42",
+		"req 42/with spaces?and=separators#fragment",
+		"请求-编号-42",
+		"traceparent-00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+	} {
+		t.Run(reqID, func(t *testing.T) {
+			seq := &sinkSeq{}
+			p := NewWithOpener(seq.next)
+			register(t, p, configYAML(""))
+			t.Cleanup(func() { _ = p.Close() })
+
+			send(t, p, "request.intercept_before", map[string]any{"RequestID": reqID, "Body": []byte("req")})
+			send(t, p, "request.complete", map[string]any{"RequestID": reqID, "Outcome": "succeeded"})
+			waitDrained(t, p)
+
+			captures := seq.at(0).snapshot()
+			if len(captures) != 1 {
+				t.Fatalf("persisted %d captures, want 1", len(captures))
+			}
+			if got := captures[0].Capture.RequestID; got != reqID {
+				t.Fatalf("stored request ID = %q, want the host's own %q", got, reqID)
+			}
+			assertSettled(t, p)
+		})
+	}
 }

@@ -102,8 +102,8 @@ func TestManagementRoutesArePrivateAndStaticShellPublic(t *testing.T) {
 }
 
 func TestPanelCaptureAndLateUsageKeyResolution(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.db")
-	store, err := storage.Open(context.Background(), storage.Config{Driver: "sqlite", DSN: path})
+	dir := filepath.Join(t.TempDir(), "data")
+	store, err := storage.Open(context.Background(), storage.Config{Driver: "sqlite", DSN: dir, WriterCount: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestPanelCaptureAndLateUsageKeyResolution(t *testing.T) {
 	// Usage RequestID differs intentionally; matching must use caller scope only.
 	send(t, p, "usage.handle", map[string]any{"RequestID": "unrelated-usage-id", "APIKey": key, "Failed": false})
 	waitStorage(t, sink.resolved)
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", filepath.Join(dir, "shard-00.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestPanelCaptureAndLateUsageKeyResolution(t *testing.T) {
 	if status != 200 || strings.Contains(string(options), key) || !strings.Contains(string(options), scope) {
 		t.Fatalf("bad key options: %s", options)
 	}
-	status, detail := managementCall(t, p, "POST", managementAPIBase+"/records/detail", map[string]any{"session_id": page.Items[0].SessionID, "request_id": "r"})
+	status, detail := managementCall(t, p, "POST", managementAPIBase+"/records/detail", map[string]any{"capture_id": page.Items[0].CaptureID})
 	var decoded storage.RecordDetail
 	if err := json.Unmarshal(detail, &decoded); err != nil {
 		t.Fatal(err)
@@ -172,8 +172,17 @@ func TestPanelCaptureAndLateUsageKeyResolution(t *testing.T) {
 	send(t, p, "usage.handle", map[string]any{"APIKey": failedKey})
 	waitStorage(t, sink.resolved)
 	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM captures WHERE request_id = ?", "failed").Scan(&count); err != nil || count != 0 {
-		t.Fatal("failed call was recorded")
+	if err := db.QueryRow("SELECT COUNT(*) FROM captures").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("captures = %d (err %v), want only the successful call", count, err)
+	}
+	// The status view reports the writer pool and the physical layout.
+	status, statusBody := managementCall(t, p, "GET", managementAPIBase+"/status", nil)
+	var stats panelStats
+	if err := json.Unmarshal(statusBody, &stats); err != nil {
+		t.Fatal(err)
+	}
+	if status != 200 || stats.Writers != 1 || stats.Shards != 1 {
+		t.Fatalf("status = %s", statusBody)
 	}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
@@ -183,6 +192,12 @@ func TestPanelCaptureAndLateUsageKeyResolution(t *testing.T) {
 	if len(p.keys) != 0 || p.keyBytes != 0 || p.bytes != 0 {
 		t.Fatal("key cache/buffers not released on shutdown")
 	}
+}
+
+// panelStats is the subset of the panel status document this test asserts on.
+type panelStats struct {
+	Writers int `json:"writers"`
+	Shards  int `json:"shards"`
 }
 
 func TestClientIdentityRejectsUpstreamSecrets(t *testing.T) {

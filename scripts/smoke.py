@@ -55,8 +55,10 @@ def main():
 
     b64 = lambda value: base64.b64encode(value).decode()
     with tempfile.TemporaryDirectory(prefix="cpa-distill-smoke-") as directory:
-        db = str(pathlib.Path(directory) / "captures.db")
-        config = json.dumps({"driver": "sqlite", "dsn": db})  # JSON is valid YAML.
+        data = str(pathlib.Path(directory) / "data")
+        # writer_count 2 is the sharded SQLite layout: a data directory with a layout
+        # manifest and one shard database per writer.
+        config = json.dumps({"driver": "sqlite", "dsn": data, "writer_count": 2})  # JSON is valid YAML.
         registration = call("plugin.register", {"config_yaml": b64(config.encode())})
         assert registration["result"]["capabilities"]["request_lifecycle_plugin"]
         assert registration["result"]["schema_version"] == 6
@@ -98,7 +100,7 @@ def main():
         # Missing request IDs / malformed shapes must still transparently pass through.
         call("response.intercept_after", {})
         # Reconfigure/drain without closing the new backend, then query via the real ABI.
-        refreshed = json.dumps({"driver": "sqlite", "dsn": db, "queue_size": 33})
+        refreshed = json.dumps({"driver": "sqlite", "dsn": data, "writer_count": 2, "queue_size": 33})
         call("plugin.reconfigure", {"config_yaml": b64(refreshed.encode())})
         api_base = "/v0/management/plugins/cpa-distill"
         status, raw_page = management("POST", api_base + "/records/search", {
@@ -108,24 +110,45 @@ def main():
         assert status == 200 and page["total"] == 2 and len(page["items"]) == 1
         assert client_key.encode() not in raw_page
         item = page["items"][0]
-        status, detail = management("POST", api_base + "/records/detail", {
-            "session_id": item["session_id"], "request_id": item["request_id"]})
+        # The record identity is the capture ID alone: the host request ID is kept
+        # verbatim for log correlation, and no session concept is exposed at all.
+        assert len(item["capture_id"]) == 32 and all(c in "0123456789abcdef" for c in item["capture_id"]), item
+        assert item["request_id"] in {"ok", "stream"}, item
+        assert "session_id" not in item, item
+        status, detail = management("POST", api_base + "/records/detail", {"capture_id": item["capture_id"]})
         detail_body = json.loads(detail)
         assert status == 200 and set(detail_body["bodies"]) == {"request_body", "response_body", "websocket_body"}, detail_body
         assert detail_body["record"]["event_count"] == item["event_count"], detail_body
         assert client_key.encode() not in detail
         status, options = management("GET", api_base + "/records/options")
         assert status == 200 and caller_scope.encode() in options and client_key.encode() not in options
+        # The status view reports the writer pool and the physical shard layout.
+        status, raw_status = management("GET", api_base + "/status")
+        stats = json.loads(raw_status)
+        assert status == 200 and stats["writers"] == 2 and stats["shards"] == 2, stats
         call("plugin.shutdown", {})  # Drains the background queue before inspection.
         api.shutdown()  # Idempotent double shutdown, as can happen during unload.
         client_request = b'{"messages":[{"role":"user","content":"hello"}]}'
-        with sqlite3.connect(db) as conn:
-            summaries = conn.execute("SELECT request_id, client_key_id FROM captures").fetchall()
-            keys = conn.execute("SELECT key_id, client_key FROM client_keys").fetchall()
-            bodies = conn.execute("SELECT request_id, request_body, response_body, websocket_body FROM capture_bodies").fetchall()
-        assert {s[0] for s in summaries} == {"ok", "stream"}, summaries
-        assert all(s[1] == caller_scope for s in summaries), summaries
-        assert any(k[0] == caller_scope and k[1] == client_key for k in keys), keys
+        # The data directory holds the layout descriptor and one database per writer.
+        manifest = json.loads((pathlib.Path(data) / "manifest.json").read_text())
+        assert manifest == {"format": "cpa-distill/capture-shards", "version": 1, "writer_count": 2,
+                            "shard_algorithm": "sha256-be64-mod-n", "shard_file": "shard-%02d.db"}, manifest
+        shards = sorted(pathlib.Path(data).glob("shard-*.db"))
+        assert [p.name for p in shards] == ["shard-00.db", "shard-01.db"], shards
+        summaries, keys, bodies = [], [], []
+        for shard in shards:
+            with sqlite3.connect(shard) as conn:
+                summaries += conn.execute("SELECT capture_id, request_id, client_key_id FROM captures").fetchall()
+                keys += conn.execute("SELECT key_id, client_key FROM client_keys").fetchall()
+                bodies += conn.execute("SELECT c.request_id, b.request_body, b.response_body, b.websocket_body "
+                                       "FROM capture_bodies b JOIN captures c ON c.capture_id = b.capture_id").fetchall()
+        assert {s[1] for s in summaries} == {"ok", "stream"}, summaries
+        assert all(s[2] == caller_scope for s in summaries), summaries
+        assert len({s[0] for s in summaries}) == 2 and all(len(s[0]) == 16 for s in summaries), summaries
+        # The key mapping is cross-shard: every shard holds the caller scope, so any
+        # shard can label the records of that scope.
+        for shard in shards:
+            assert any(k[0] == caller_scope and k[1] == client_key for k in keys), (shard, keys)
         by_id = {b[0]: b[1:] for b in bodies}
         assert set(by_id) == {"ok", "stream"}, by_id
         # request_body 只取客户端首次 before.Body；after 的上游请求正文不保存。
@@ -136,7 +159,7 @@ def main():
         for _, request_body, response_body, websocket_body in bodies:
             raw = (request_body or b"") + (response_body or b"") + (websocket_body or b"")
             assert client_key.encode() not in raw and b"never-store" not in raw, raw
-    print("PASS: C ABI load, transparent hooks, success-only capture, client key attribution, body reconstruction, panel routes, filtered pagination, detail, shutdown drain")
+    print("PASS: C ABI load, transparent hooks, success-only capture, capture_id identity, sharded SQLite layout with cross-shard key mapping, body reconstruction, panel routes, filtered pagination, detail by capture_id, shutdown drain")
 
 
 if __name__ == "__main__":

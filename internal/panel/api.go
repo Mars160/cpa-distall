@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -19,13 +20,15 @@ const MaxRequestBody = 16 << 10
 type Reader interface {
 	SearchRecords(context.Context, storage.RecordFilter) (storage.RecordPage, error)
 	RecordOptions(context.Context) (storage.RecordOptions, error)
-	RecordDetail(context.Context, string, string) (storage.RecordDetail, error)
+	RecordDetail(context.Context, string) (storage.RecordDetail, error)
 }
 
 type Stats struct {
 	PendingRequests int    `json:"pending_requests"`
 	BufferBytes     int    `json:"buffer_bytes"`
 	QueueLength     int    `json:"queue_length"`
+	Writers         int    `json:"writers"`
+	Shards          int    `json:"shards"`
 	Dropped         uint64 `json:"dropped"`
 	WriteFailures   uint64 `json:"write_failures"`
 }
@@ -130,7 +133,13 @@ func HandleAPI(ctx context.Context, method, path string, body []byte, reader Rea
 			return apiError(503, "记录存储尚未就绪")
 		}
 		result, err := reader.SearchRecords(ctx, filter)
-		if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrSearchWindowTooDeep):
+			// 分片合并无法下推 offset，深页会物化 shards*(offset+limit) 条记录，
+			// 因此超过窗口直接按客户端错误拒绝，而不是把内存交给调用方。
+			return apiError(400, fmt.Sprintf("跨分片查询最多浏览前 %d 条记录（offset+limit ≤ %d），请缩窄筛选条件或按 capture_id 查看单条记录",
+				storage.MaxSearchWindow, storage.MaxSearchWindow))
+		case err != nil:
 			return apiError(503, "记录查询失败，请稍后重试")
 		}
 		return jsonResponse(200, result)
@@ -139,16 +148,21 @@ func HandleAPI(ctx context.Context, method, path string, body []byte, reader Rea
 			return apiError(405, "请使用 POST 查询详情")
 		}
 		var req struct {
-			SessionID string `json:"session_id"`
-			RequestID string `json:"request_id"`
+			CaptureID string `json:"capture_id"`
 		}
-		if decode(body, &req) != nil || strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.RequestID) == "" || len(req.SessionID) > 256 || len(req.RequestID) > 256 {
-			return apiError(400, "缺少或无效的 session_id / request_id")
+		if decode(body, &req) != nil {
+			return apiError(400, "缺少或无效的 capture_id")
+		}
+		// The detail view is addressed by capture ID alone. The shape is checked here
+		// so a malformed ID is a client error instead of a store error.
+		captureID := strings.TrimSpace(req.CaptureID)
+		if _, err := storage.ParseCaptureID(captureID); err != nil {
+			return apiError(400, "缺少或无效的 capture_id")
 		}
 		if reader == nil {
 			return apiError(503, "记录存储尚未就绪")
 		}
-		result, err := reader.RecordDetail(ctx, req.SessionID, req.RequestID)
+		result, err := reader.RecordDetail(ctx, captureID)
 		if errors.Is(err, storage.ErrNotFound) {
 			return apiError(404, "记录不存在")
 		}

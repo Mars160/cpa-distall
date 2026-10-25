@@ -19,18 +19,18 @@ func TestApplySummaryAttributes(t *testing.T) {
 		Stream:         json.RawMessage(`true`),
 		SourceFormat:   json.RawMessage(`"openai"`),
 	}
-	applySummary(&c, &env, now)
+	applySummary(&c, parseSummary(&env), now)
 	if c.Model != "upstream-a" || c.RequestedModel != "alias-a" || !c.Stream || c.SourceFormat != "openai" || !c.StartedAt.Equal(now) {
 		t.Fatalf("unexpected capture: %+v", c)
 	}
 	// A malformed optional attribute is ignored; it must not erase earlier values.
 	env = hookEnvelope{Model: json.RawMessage(`123`), RequestedModel: json.RawMessage(`"alias-b"`)}
-	applySummary(&c, &env, now.Add(time.Second))
+	applySummary(&c, parseSummary(&env), now.Add(time.Second))
 	if c.Model != "upstream-a" || c.RequestedModel != "alias-b" || !c.Stream || !c.StartedAt.Equal(now) {
 		t.Fatalf("merge lost prior attributes: %+v", c)
 	}
 	env = hookEnvelope{StartedAt: json.RawMessage(`"2026-10-15T11:59:59Z"`), CompletedAt: json.RawMessage(`"2026-10-15T12:00:01Z"`)}
-	applySummary(&c, &env, now.Add(time.Second))
+	applySummary(&c, parseSummary(&env), now.Add(time.Second))
 	if !c.StartedAt.Equal(now.Add(-time.Second)) || !c.CompletedAt.Equal(now.Add(time.Second)) {
 		t.Fatalf("terminal timestamps ignored: %+v", c)
 	}
@@ -136,6 +136,38 @@ func TestBodyGrowthMirrorsAccumulation(t *testing.T) {
 	}
 	if got := bodyGrowth("websocket.response_event", &env, 0, false, &pending{websocketBody: []byte("a")}); got != 5 {
 		t.Errorf("websocket growth with separator = %d, want 5", got)
+	}
+}
+
+func TestPendingSizeChargesFragmentCapacityAndReferences(t *testing.T) {
+	// The budget must follow what the process actually holds: one slice header per
+	// capacity slot plus the capacity of every fragment buffer, not its length.
+	chunk := make([]byte, 10, 4096)
+	// Directly built pending state must seed the running counter the hook path keeps,
+	// so pendingSize stays O(1) per fragment instead of rescanning the list.
+	item := &pending{capture: storage.Capture{CaptureID: "0123456789abcdef0123456789abcdef"}, streamChunks: [][]byte{chunk}, chunkBytes: cap(chunk)}
+	want := len("0123456789abcdef0123456789abcdef") + captureOverhead + cap(item.streamChunks)*streamChunkRefOverhead + cap(chunk)
+	if got := pendingSize(item); got != want {
+		t.Fatalf("pendingSize with one 10-byte/4096-cap fragment = %d, want %d", got, want)
+	}
+	// The running counter must agree with a full scan of the retained fragments.
+	if got := item.chunkBytes + cap(item.streamChunks)*streamChunkRefOverhead; got != streamChunksSize(item.streamChunks) {
+		t.Fatalf("running counter %d disagrees with a full scan %d", got, streamChunksSize(item.streamChunks))
+	}
+	// A 4096-byte fragment is charged its capacity even when its length is small.
+	if got := streamChunksSize(item.streamChunks); got != cap(item.streamChunks)*streamChunkRefOverhead+4096 {
+		t.Fatalf("streamChunksSize = %d, want capacity-based accounting", got)
+	}
+	// A nil fragment list retains nothing.
+	if got := streamChunksSize(nil); got != 0 {
+		t.Fatalf("streamChunksSize(nil) = %d, want 0", got)
+	}
+	// Every capacity slot costs a header, even the unused ones.
+	grown := make([][]byte, 2, 8)
+	grown[0] = make([]byte, 0, 5)
+	grown[1] = make([]byte, 3, 4)
+	if got := streamChunksSize(grown); got != 8*streamChunkRefOverhead+5+4 {
+		t.Fatalf("streamChunksSize(grown) = %d, want %d", got, 8*streamChunkRefOverhead+9)
 	}
 }
 

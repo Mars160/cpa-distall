@@ -1,6 +1,12 @@
 -- Queries shared by both engines for the captures summary, the capture_bodies
 -- payload table and the client_keys table.
 --
+-- capture_id is the primary key of a capture and the only join key: the summary
+-- and the bodies of one call always live in the same database (the shard its
+-- capture_id maps to) and are written in one transaction. The host request ID is
+-- stored verbatim in request_id, a support-only column with neither a uniqueness
+-- constraint nor an index, so it is never an identity and never a join key.
+--
 -- Filters are optional: a NULL bind parameter means "not filtered" (sqlc.narg
 -- renders it as sql.NullString / sql.NullInt64). An empty but valid client_key_id
 -- means "the rows without a known key", which is how the unknown-key option is
@@ -8,12 +14,12 @@
 -- concatenated into SQL.
 --
 -- started_at_us is the range key: from is inclusive, to is exclusive.
--- Ordering is started_at_us DESC, session_id DESC, request_id DESC: it is total
--- because (session_id, request_id) is the primary key.
+-- Ordering is started_at_us DESC, capture_id DESC: it is total because capture_id
+-- is the primary key, so the sharded merge is deterministic.
 
 -- name: InsertCapture :exec
 INSERT INTO captures (
-    session_id,
+    capture_id,
     request_id,
     client_key_id,
     model,
@@ -24,7 +30,7 @@ INSERT INTO captures (
     completed_at_us,
     event_count
 ) VALUES (
-    sqlc.arg(session_id),
+    sqlc.arg(capture_id),
     sqlc.arg(request_id),
     sqlc.arg(client_key_id),
     sqlc.arg(model),
@@ -38,14 +44,12 @@ INSERT INTO captures (
 
 -- name: InsertCaptureBodies :exec
 INSERT INTO capture_bodies (
-    session_id,
-    request_id,
+    capture_id,
     request_body,
     response_body,
     websocket_body
 ) VALUES (
-    sqlc.arg(session_id),
-    sqlc.arg(request_id),
+    sqlc.arg(capture_id),
     sqlc.arg(request_body),
     sqlc.arg(response_body),
     sqlc.arg(websocket_body)
@@ -57,8 +61,7 @@ SELECT
     response_body,
     websocket_body
 FROM capture_bodies
-WHERE session_id = sqlc.arg(session_id)
-  AND request_id = sqlc.arg(request_id);
+WHERE capture_id = sqlc.arg(capture_id);
 
 -- name: UpsertClientKey :exec
 -- The key is written only when the stored plaintext differs, so a repeated upsert
@@ -77,7 +80,7 @@ WHERE client_keys.client_key <> excluded.client_key;
 
 -- name: GetCapture :one
 SELECT
-    session_id,
+    capture_id,
     request_id,
     client_key_id,
     model,
@@ -88,8 +91,7 @@ SELECT
     completed_at_us,
     event_count
 FROM captures
-WHERE session_id = sqlc.arg(session_id)
-  AND request_id = sqlc.arg(request_id);
+WHERE capture_id = sqlc.arg(capture_id);
 
 -- name: CountCaptures :one
 SELECT COUNT(*) AS total
@@ -104,10 +106,13 @@ WHERE (CAST(sqlc.narg(from_us) AS BIGINT) IS NULL OR started_at_us >= sqlc.narg(
   );
 
 -- name: ListCaptures :many
+-- One shard is scanned at most page_offset + page_limit rows deep: the global
+-- (offset, limit) window is a subset of the union of the per-shard windows, so
+-- the caller merges the shard results and slices the window out of the merge.
 -- The list joins client_keys so the caller scope can be labelled without exposing
 -- the plaintext through any JSON representation (Capture.ClientKey is json:"-").
 SELECT
-    c.session_id,
+    c.capture_id,
     c.request_id,
     COALESCE(k.client_key, '') AS client_key,
     c.client_key_id,
@@ -128,8 +133,8 @@ WHERE (CAST(sqlc.narg(from_us) AS BIGINT) IS NULL OR c.started_at_us >= sqlc.nar
       OR c.model = sqlc.narg(filter_model)
       OR c.requested_model = sqlc.narg(filter_model)
   )
-ORDER BY c.started_at_us DESC, c.session_id DESC, c.request_id DESC
-LIMIT sqlc.arg(page_size) OFFSET sqlc.arg(page_offset);
+ORDER BY c.started_at_us DESC, c.capture_id DESC
+LIMIT sqlc.arg(page_limit) OFFSET sqlc.arg(page_offset);
 
 -- name: ListCaptureKeys :many
 -- Distinct caller scopes seen in the summaries, joined with the plaintext key so a

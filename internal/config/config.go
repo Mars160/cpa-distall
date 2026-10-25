@@ -9,9 +9,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// MaxWriterCount is the largest writer_count the plugin accepts. It mirrors
+// storage.MaxWriterCount: one SQLite shard database and one writer goroutine per
+// writer, so the limit is a safety valve against a configuration that would open
+// hundreds of files and goroutines.
+const MaxWriterCount = 64
+
 type Config struct {
 	Driver             string `yaml:"driver"`
 	DSN                string `yaml:"dsn"`
+	WriterCount        int    `yaml:"writer_count"`
 	WriteTimeout       string `yaml:"write_timeout"`
 	DrainTimeout       string `yaml:"drain_timeout"`
 	MaxRequestBytes    int    `yaml:"max_request_bytes"`
@@ -22,7 +29,7 @@ type Config struct {
 }
 
 func Parse(raw string) (Config, error) {
-	c := Config{Driver: "sqlite", WriteTimeout: "5s", DrainTimeout: "5s", MaxRequestBytes: 64 << 20, MaxBufferBytes: 256 << 20, MaxPendingRequests: 1024, QueueSize: 32, RequestTTL: "30m"}
+	c := Config{Driver: "sqlite", WriterCount: 1, WriteTimeout: "5s", DrainTimeout: "5s", MaxRequestBytes: 64 << 20, MaxBufferBytes: 256 << 20, MaxPendingRequests: 1024, QueueSize: 32, RequestTTL: "30m"}
 	// enabled and priority are host-owned; unknown fields remain compatible.
 	if err := yaml.Unmarshal([]byte(raw), &c); err != nil {
 		return Config{}, fmt.Errorf("invalid plugin YAML: %w", err)
@@ -35,7 +42,12 @@ func Parse(raw string) (Config, error) {
 		if c.Driver == "postgres" {
 			return Config{}, fmt.Errorf("postgres requires dsn")
 		}
-		c.DSN = "cpa-distill.db"
+		// The sqlite DSN is a data directory holding the layout manifest and the
+		// shard databases; it is never a single database file.
+		c.DSN = "cpa-distill-data"
+	}
+	if c.WriterCount < 1 || c.WriterCount > MaxWriterCount {
+		return Config{}, fmt.Errorf("writer_count must be between 1 and %d", MaxWriterCount)
 	}
 	d, err := time.ParseDuration(c.WriteTimeout)
 	if err != nil || d <= 0 || d > time.Minute {

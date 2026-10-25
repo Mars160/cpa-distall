@@ -346,6 +346,7 @@
     page: 1,
     pageSize: 20,
     total: 0,
+    shards: 0, // 最近一次 /status 的分片数：>1 时跨分片查询存在窗口上限
     items: [],
     options: { keys: [], models: [] },
     searchSeq: 0,
@@ -789,6 +790,7 @@
     state.items = [];
     state.total = 0;
     state.page = 1;
+    state.shards = 0;
     state.options = { keys: [], models: [] };
     clear(recordsBody);
     clear(keySelect);
@@ -836,9 +838,24 @@
    * 查询与列表
    * ------------------------------------------------------------------ */
 
+  // 跨分片合并无法下推 offset，后端只服务 offset+limit ≤ MAX_WINDOW 的页；
+  // 该值必须与 internal/storage.MaxSearchWindow 保持一致（后端是最终裁决方）。
+  var MAX_WINDOW = 10000;
+
   function pageCount() {
     if (state.total <= 0) return 1;
     return Math.max(1, Math.ceil(state.total / state.pageSize));
+  }
+
+  // 多分片时可请求的最大页码：offset+limit = page*pageSize ≤ MAX_WINDOW。
+  // 单库（分片数为 1 或未知）不受限制，offset 由数据库自己处理。
+  function maxReachablePage() {
+    if (!(state.shards > 1)) return pageCount();
+    return Math.min(pageCount(), Math.max(1, Math.floor(MAX_WINDOW / state.pageSize)));
+  }
+
+  function windowLimited() {
+    return state.shards > 1 && state.total > MAX_WINDOW;
   }
 
   function validateFilters() {
@@ -874,6 +891,10 @@
     }
     showError(searchError, '');
     if (resetPage) state.page = 1;
+    // 切到更大的每页条数（或从深页返回）后，原页码可能已越过跨分片窗口，
+    // 先收敛到可请求范围，避免后端用 400 拒绝。
+    var reachable = maxReachablePage();
+    if (state.page > reachable) state.page = reachable;
 
     var seq = state.searchSeq + 1;
     state.searchSeq = seq;
@@ -971,9 +992,9 @@
     row.appendChild(keyCell);
 
     var idCell = el('td');
-    idCell.appendChild(el('div', { className: 'mono truncate', text: item.request_id || '—', title: item.request_id || '' }));
-    if (item.session_id) {
-      idCell.appendChild(el('div', { className: 'mono truncate muted small', text: item.session_id, title: item.session_id }));
+    idCell.appendChild(el('div', { className: 'mono truncate', text: item.capture_id || '—', title: item.capture_id || '' }));
+    if (item.request_id) {
+      idCell.appendChild(el('div', { className: 'mono truncate muted small', text: item.request_id, title: item.request_id }));
     }
     row.appendChild(idCell);
 
@@ -987,10 +1008,12 @@
 
   function renderPager() {
     var pages = pageCount();
-    pageInfo.textContent = '第 ' + state.page + ' / ' + pages + ' 页 · 共 ' + state.total + ' 条 · 每页 ' + state.pageSize + ' 条';
+    var reachable = maxReachablePage();
+    pageInfo.textContent = '第 ' + state.page + ' / ' + pages + ' 页 · 共 ' + state.total + ' 条 · 每页 ' + state.pageSize + ' 条'
+      + (windowLimited() ? ' · 跨分片仅可浏览前 ' + fmtNum(MAX_WINDOW) + ' 条，请缩窄筛选' : '');
     resultSummary.textContent = '共 ' + state.total + ' 条匹配记录';
     var atFirst = state.page <= 1;
-    var atLast = state.page >= pages;
+    var atLast = state.page >= reachable;
     pageFirst.disabled = atFirst;
     pagePrev.disabled = atFirst;
     pageNext.disabled = atLast;
@@ -998,8 +1021,8 @@
   }
 
   function gotoPage(page) {
-    var pages = pageCount();
-    var target = Math.min(Math.max(1, page), pages);
+    // 末页/下一页不得越过跨分片窗口，否则后端会直接返回 400。
+    var target = Math.min(Math.max(1, page), maxReachablePage());
     if (target === state.page) return;
     state.page = target;
     runSearch(false);
@@ -1039,7 +1062,7 @@
 
     apiFetch('/records/detail', {
       method: 'POST',
-      body: { session_id: item.session_id, request_id: item.request_id },
+      body: { capture_id: item.capture_id },
       signal: controller.signal
     }).then(function (data) {
       if (seq !== state.detailSeq) return;
@@ -1072,7 +1095,7 @@
   }
 
   function bodyFilename(kind, record, bytes) {
-    var id = (record && record.request_id) ? String(record.request_id) : 'unknown';
+    var id = (record && record.capture_id) ? String(record.capture_id) : 'unknown';
     id = id.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64) || 'unknown';
     return 'cpa-distill-' + kind + '-' + id + extensionFor(bytes);
   }
@@ -1126,7 +1149,7 @@
     var section = el('section', { className: 'section' });
     section.appendChild(el('h3', { text: '基础信息' }));
     section.appendChild(kvList([
-      ['session_id', record.session_id, 'mono'],
+      ['capture_id', record.capture_id, 'mono'],
       ['request_id', record.request_id, 'mono'],
       ['client_key_id', record.client_key_id ? (labelForKey(record.client_key_id) + '（' + record.client_key_id + '）') : '', 'mono'],
       ['请求模型（requested_model）', record.requested_model],
@@ -1182,9 +1205,16 @@
 
     return apiFetch('/status', { method: 'GET', signal: controller.signal }).then(function (data) {
       if (seq !== state.statusSeq) return;
+      var shards = (data && typeof data.shards === 'number' && data.shards > 0) ? data.shards : state.shards;
+      if (shards !== state.shards) {
+        state.shards = shards;
+        renderPager();
+      }
       statusBar.classList.remove('error-text');
       statusBar.textContent = '待处理 ' + fmtNum(data && data.pending_requests)
         + ' · 缓冲 ' + fmtBytes(data && data.buffer_bytes)
+        + ' · 写入者 ' + fmtNum(data && data.writers)
+        + ' · 分片 ' + fmtNum(data && data.shards)
         + ' · 丢弃 ' + fmtNum(data && data.dropped)
         + ' · 写失败 ' + fmtNum(data && data.write_failures)
         + ' · 队列 ' + fmtNum(data && data.queue_length);

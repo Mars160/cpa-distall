@@ -5,7 +5,7 @@
 package postgresdb
 
 type Capture struct {
-	SessionID      string
+	CaptureID      []byte
 	RequestID      string
 	ClientKeyID    string
 	Model          string
@@ -18,8 +18,7 @@ type Capture struct {
 }
 
 type CaptureBody struct {
-	SessionID     string
-	RequestID     string
+	CaptureID     []byte
 	RequestBody   []byte
 	ResponseBody  []byte
 	WebsocketBody []byte

@@ -115,31 +115,56 @@ func decodeTimestamp(raw json.RawMessage) time.Time {
 	return t.UTC()
 }
 
-// applySummary folds the small typed attributes of one envelope into the capture
-// header. A malformed optional attribute is ignored: it never discards body bytes
-// and never clears an attribute an earlier event already provided.
-func applySummary(c *storage.Capture, env *hookEnvelope, now time.Time) {
-	if v := decodeText(env.Model); v != "" {
-		c.Model = v
+// applySummary folds the pre-parsed typed attributes of one envelope into the
+// capture header. It runs under the plugin lock and performs only assignments: the
+// JSON work happened in parseSummary, outside the lock. A malformed optional
+// attribute is ignored: it never discards body bytes and never clears an attribute
+// an earlier event already provided.
+func applySummary(c *storage.Capture, s summary, now time.Time) {
+	if s.model != "" {
+		c.Model = s.model
 	}
-	if v := decodeText(env.RequestedModel); v != "" {
-		c.RequestedModel = v
+	if s.requestedModel != "" {
+		c.RequestedModel = s.requestedModel
 	}
-	if v := decodeText(env.SourceFormat); v != "" {
-		c.SourceFormat = v
+	if s.sourceFormat != "" {
+		c.SourceFormat = s.sourceFormat
 	}
-	if v, ok := decodeBool(env.Stream); ok {
-		c.Stream = v
+	if s.hasStream {
+		c.Stream = s.stream
 	}
 	if c.StartedAt.IsZero() {
 		c.StartedAt = now
 	}
-	if t := decodeTimestamp(env.StartedAt); !t.IsZero() {
-		c.StartedAt = t
+	if !s.startedAt.IsZero() {
+		c.StartedAt = s.startedAt
 	}
-	if t := decodeTimestamp(env.CompletedAt); !t.IsZero() {
-		c.CompletedAt = t
+	if !s.completedAt.IsZero() {
+		c.CompletedAt = s.completedAt
 	}
+}
+
+// summary is the decoded, typed view of the optional attributes of one envelope.
+// Decoding it is the only work applySummary used to do under the lock.
+type summary struct {
+	model, requestedModel, sourceFormat string
+	stream, hasStream                   bool
+	startedAt, completedAt              time.Time
+}
+
+// parseSummary decodes the optional attributes of one envelope. It runs outside
+// the plugin lock; a malformed value yields the zero value, so it is ignored
+// rather than aborting the capture.
+func parseSummary(env *hookEnvelope) summary {
+	s := summary{
+		model:          decodeText(env.Model),
+		requestedModel: decodeText(env.RequestedModel),
+		sourceFormat:   decodeText(env.SourceFormat),
+		startedAt:      decodeTimestamp(env.StartedAt),
+		completedAt:    decodeTimestamp(env.CompletedAt),
+	}
+	s.stream, s.hasStream = decodeBool(env.Stream)
+	return s
 }
 
 // decodedBodyLen is the number of bytes a base64 body field decodes to, computed
