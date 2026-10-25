@@ -7,8 +7,20 @@ plugins:
       enabled: true
       priority: 1
       driver: sqlite
-      # Absolute path recommended; parent directory must already exist.
-      dsn: /absolute/path/to/cpa-distill.db
+      # SQLite DSN is a DATA DIRECTORY, not a database file: the plugin writes
+      # manifest.json plus one shard-XX.db per writer inside it. It is created if
+      # missing; an existing directory must match its manifest exactly, and a plain
+      # .db file path (or a file: URI) is rejected instead of being reinterpreted.
+      # The manifest is published only after every shard database exists, and a
+      # missing shard file is refused instead of being replaced by an empty one.
+      # One plugin instance per data directory: a published layout is never
+      # overwritten by a second initialisation. Absolute path recommended; the
+      # parent directory must already exist.
+      dsn: /absolute/path/to/cpa-distill-data
+      # Concurrent writers. SQLite opens one shard database per writer; PostgreSQL
+      # uses multiple writers on one database and sizes its connection pool. The queue and the memory budget stay global
+      # and are never multiplied by this value. Default 1, maximum 64.
+      writer_count: 4
       write_timeout: 5s
       drain_timeout: 5s
       max_request_bytes: 67108864
@@ -20,4 +32,5 @@ plugins:
       # PostgreSQL alternative (create a dedicated database first):
       # driver: postgres
       # dsn: "postgres://distill:password@127.0.0.1:5432/distill?sslmode=verify-full"
+      # writer_count: 4   # 4 writers, pool at least 4 connections; no sharding
       # For local tests only you may need sslmode=disable; use TLS in production.
